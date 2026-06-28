@@ -23,3 +23,10 @@ lightning_logs/
 
 file/
 
+# User data and training artifacts
+data/
+g2pW/
+neil_export/
+
+*.zip
+*.sh
