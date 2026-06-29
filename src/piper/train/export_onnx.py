@@ -10,7 +10,7 @@ import torch
 from .vits.lightning import VitsModel
 
 _LOGGER = logging.getLogger(__name__)
-OPSET_VERSION = 15
+OPSET_VERSION = 18
 
 
 def main() -> None:
@@ -89,6 +89,8 @@ def main() -> None:
     dummy_input = (sequences, sequence_lengths, scales, sid)
 
     # Export
+    # Use dynamo=False to avoid data-dependent control flow errors
+    # (VITS flow layers contain dynamic indexing incompatible with torch.export)
     torch.onnx.export(
         model=model_g,
         args=dummy_input,
@@ -102,6 +104,7 @@ def main() -> None:
             "input_lengths": {0: "batch_size"},
             "output": {0: "batch_size", 2: "time"},
         },
+        dynamo=False,
     )
     _LOGGER.info("Exported model to %s", output_path)
 
