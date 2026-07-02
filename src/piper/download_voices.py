@@ -8,9 +8,9 @@ import shutil
 from pathlib import Path
 from urllib.request import urlopen
 
-URL_FORMAT = "https://huggingface.co/rhasspy/piper-voices/resolve/main/{lang_family}/{lang_code}/{voice_name}/{voice_quality}/{lang_code}-{voice_name}-{voice_quality}{extension}?download=true"
+URL_FORMAT = "https://hf-mirror.com/rhasspy/piper-voices/resolve/main/{lang_family}/{lang_code}/{voice_name}/{voice_quality}/{lang_code}-{voice_name}-{voice_quality}{extension}?download=true"
 VOICES_JSON = (
-    "https://huggingface.co/rhasspy/piper-voices/resolve/main/voices.json?download=true"
+    "https://hf-mirror.com/rhasspy/piper-voices/resolve/main/voices.json?download=true"
 )
 VOICE_PATTERN = re.compile(
     r"^(?P<lang_family>[^-]+)_(?P<lang_region>[^-]+)-(?P<voice_name>[^-]+)-(?P<voice_quality>.+)$"

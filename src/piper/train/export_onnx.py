@@ -2,12 +2,20 @@
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 from typing import Optional
 
 import torch
 
-from .vits.lightning import VitsModel
+# Allow running this script directly (python export_onnx.py) as well as
+# via the package (python -m piper.train.export_onnx).
+if __package__ is None:
+    _src_dir = Path(__file__).resolve().parent.parent.parent
+    sys.path.insert(0, str(_src_dir))
+    from piper.train.vits.lightning import VitsModel
+else:
+    from .vits.lightning import VitsModel
 
 _LOGGER = logging.getLogger(__name__)
 OPSET_VERSION = 18

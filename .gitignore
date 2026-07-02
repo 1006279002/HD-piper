@@ -31,4 +31,6 @@ neil_export/
 *.zip
 *.sh
 
-step_spectral_eq（0616）.py
+.vscode/
+
+outputs/
