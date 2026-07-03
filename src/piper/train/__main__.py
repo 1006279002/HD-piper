@@ -25,6 +25,8 @@ class VitsLightningCLI(LightningCLI):
         parser.link_arguments("model.hop_length", "data.hop_length")
         parser.link_arguments("model.win_length", "data.win_length")
         parser.link_arguments("model.segment_size", "data.segment_size")
+        # EQ conditioning (model controls whether EQ is used)
+        parser.link_arguments("model.use_eq_conditioning", "data.use_eq_conditioning")
 
     def _parse_ckpt_path(self) -> None:
         """Skip hyperparameter parsing from checkpoint.

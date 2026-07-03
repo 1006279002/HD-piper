@@ -34,7 +34,7 @@ VAD_SAMPLE_RATE = 16000
 @dataclass
 class CachedUtterance:
     phoneme_ids_path: Path
-    audio_norm_path: Path
+    audio_norm_path: Path   # when EQ: [N,T] stacked; no EQ: [T]
     audio_spec_path: Path
     text: Optional[str] = None
     speaker_id: Optional[int] = None
@@ -73,6 +73,10 @@ class VitsDataModule(L.LightningDataModule):
         dataset_type: Union[str, DatasetType] = DatasetType.TEXT.value,
         phonemes_path: Optional[Union[str, Path]] = None,
         vowel_clusters: Optional[str] = None,
+        # EQ conditioning
+        eq_audio_base_dir: Optional[Union[str, Path]] = None,
+        eq_audiogram_params: Optional[List[List[float]]] = None,
+        use_eq_conditioning: bool = False,
     ) -> None:
         super().__init__()
 
@@ -115,6 +119,26 @@ class VitsDataModule(L.LightningDataModule):
 
         self.piper_config: Optional[PiperConfig] = None
         self.is_multispeaker = self.num_speakers > 1
+
+        # EQ conditioning
+        self.eq_audio_base_dir: Optional[Path] = None
+        if eq_audio_base_dir is not None:
+            self.eq_audio_base_dir = Path(eq_audio_base_dir)
+
+        if eq_audiogram_params is not None:
+            self.eq_audiogram_params = eq_audiogram_params
+        else:
+            # Default: 2 EQ profiles — EQ_0 (clean) + EQ_1 (single EQ treatment)
+            # Values are dB gains at frequencies [250, 500, 1000, 2000, 4000, 8000] Hz
+            self.eq_audiogram_params = [
+                [0, 0, 0, 0, 0, 0],          # EQ_0: no EQ (clean audio)
+                [65, 70, 70, 65, 75, 90],     # EQ_1: BASELINE
+            ]
+
+        self.num_eq_profiles = len(self.eq_audiogram_params)
+        self.use_eq_conditioning = use_eq_conditioning and (
+            (self.eq_audio_base_dir is not None) and (self.num_eq_profiles > 0)
+        )
 
         # Phonemes
         if phoneme_type is None:
@@ -336,7 +360,7 @@ class VitsDataModule(L.LightningDataModule):
                         if report_prepare is None:
                             report_prepare = True
 
-                # normalized audio
+                # normalized audio — merge all profiles into one [N, T] tensor
                 norm_audio_path = self.cache_dir / f"{cache_id}.audio.pt"
                 audio_norm_tensor: Optional[torch.Tensor] = None
                 if not norm_audio_path.exists():
@@ -345,37 +369,59 @@ class VitsDataModule(L.LightningDataModule):
                     )
                     if self.trim_silence:
                         if audio_sample_rate != VAD_SAMPLE_RATE:
-                            # VAD needs 16Khz
                             audio_16khz_array, _sr = librosa.load(
                                 path=audio_path, sr=VAD_SAMPLE_RATE, mono=True
                             )
                         else:
                             audio_16khz_array = audio_norm_array
-
                         audio_norm_array = self._trim_silence(
                             audio_norm_array, audio_16khz_array, vad
                         )
 
                     audio_norm_tensor = torch.FloatTensor(audio_norm_array)
-                    torch.save(
-                        audio_norm_tensor,
-                        norm_audio_path,
-                    )
+
+                    if self.use_eq_conditioning:
+                        # Merge original + all EQ variants into one [N, T] file
+                        assert self.eq_audio_base_dir is not None
+                        stacked = [audio_norm_tensor]  # profile 0 = clean
+                        for eq_idx in range(1, self.num_eq_profiles):
+                            eq_audio_dir = self.eq_audio_base_dir / f"EQ_{eq_idx}"
+                            eq_audio_file = eq_audio_dir / utt_id
+                            if not eq_audio_file.exists():
+                                eq_audio_file = eq_audio_dir / f"{utt_id}.wav"
+                            if eq_audio_file.exists():
+                                eq_arr, _sr = librosa.load(
+                                    path=str(eq_audio_file),
+                                    sr=self.sample_rate,
+                                    mono=True,
+                                )
+                                stacked.append(torch.FloatTensor(eq_arr))
+                        if len(stacked) == self.num_eq_profiles:
+                            # Trim to shortest length (EQ filters may change duration)
+                            min_len = min(t.size(0) for t in stacked)
+                            stacked = [t[:min_len] for t in stacked]
+                            audio_norm_tensor = torch.stack(stacked, dim=0)  # [N, T]
+
+                    torch.save(audio_norm_tensor, norm_audio_path)
                     if report_prepare is None:
                         report_prepare = True
 
-                # mel spectrogram
+                # mel spectrogram (always from clean audio = profile 0)
                 audio_spec_path = self.cache_dir / f"{cache_id}.spec.pt"
                 if not audio_spec_path.exists():
                     if audio_norm_tensor is None:
-                        # Load audio from cache
                         audio_norm_tensor = torch.load(norm_audio_path)
 
                     assert audio_norm_tensor is not None
+                    # Use profile 0 (clean) for spec when stacked, or the tensor itself
+                    spec_audio = (
+                        audio_norm_tensor[0] if audio_norm_tensor.dim() == 2
+                        else audio_norm_tensor
+                    )
 
                     torch.save(
                         spectrogram_torch(
-                            y=audio_norm_tensor.unsqueeze(0),
+                            y=spec_audio.unsqueeze(0),
                             n_fft=self.filter_length,
                             sampling_rate=self.sample_rate,
                             hop_size=self.hop_length,
@@ -471,7 +517,12 @@ class VitsDataModule(L.LightningDataModule):
                     )
                 )
 
-        full_dataset = VitsDataset(all_utts)
+        full_dataset = VitsDataset(
+            all_utts,
+            eq_audiogram_params=(
+                self.eq_audiogram_params if self.use_eq_conditioning else None
+            ),
+        )
 
         valid_set_size = int(len(full_dataset) * self.validation_split)
         train_set_size = len(full_dataset) - valid_set_size - self.num_test_examples
@@ -483,30 +534,42 @@ class VitsDataModule(L.LightningDataModule):
         return DataLoader(
             self.train_dataset,
             collate_fn=UtteranceCollate(
-                is_multispeaker=(self.num_speakers > 1), segment_size=self.segment_size
+                is_multispeaker=(self.num_speakers > 1),
+                segment_size=self.segment_size,
+                use_eq=self.use_eq_conditioning,
             ),
             batch_size=self.batch_size,
             num_workers=self.num_workers,
+            prefetch_factor=4,
+            persistent_workers=True,
         )
 
     def test_dataloader(self):
         return DataLoader(
             self.test_dataset,
             collate_fn=UtteranceCollate(
-                is_multispeaker=(self.num_speakers > 1), segment_size=self.segment_size
+                is_multispeaker=(self.num_speakers > 1),
+                segment_size=self.segment_size,
+                use_eq=self.use_eq_conditioning,
             ),
             batch_size=self.batch_size,
             num_workers=self.num_workers,
+            prefetch_factor=4,
+            persistent_workers=True,
         )
 
     def val_dataloader(self):
         return DataLoader(
             self.val_dataset,
             collate_fn=UtteranceCollate(
-                is_multispeaker=(self.num_speakers > 1), segment_size=self.segment_size
+                is_multispeaker=(self.num_speakers > 1),
+                segment_size=self.segment_size,
+                use_eq=self.use_eq_conditioning,
             ),
             batch_size=self.batch_size,
             num_workers=self.num_workers,
+            prefetch_factor=4,
+            persistent_workers=True,
         )
 
     def _trim_silence(
@@ -575,6 +638,8 @@ class UtteranceTensors:
     audio_norm: FloatTensor
     speaker_id: Optional[LongTensor] = None
     text: Optional[str] = None
+    eq_audio: Optional[FloatTensor] = None
+    eq_params: Optional[FloatTensor] = None  # [n_bands]
 
     @property
     def spec_length(self) -> int:
@@ -590,32 +655,64 @@ class Batch:
     audios: FloatTensor
     audio_lengths: LongTensor
     speaker_ids: Optional[LongTensor] = None
+    eq_audios: Optional[FloatTensor] = None
+    eq_params: Optional[FloatTensor] = None  # [B, n_bands]
 
 
 class VitsDataset(Dataset):
-    def __init__(self, utts: list[CachedUtterance]):
+    def __init__(
+        self,
+        utts: list[CachedUtterance],
+        eq_audiogram_params: Optional[List[List[float]]] = None,
+    ):
         self.utts = utts
+        self.eq_audiogram_params = eq_audiogram_params
+        self.use_eq = (eq_audiogram_params is not None) and (len(eq_audiogram_params) > 0)
+        self.num_eq_profiles = len(eq_audiogram_params) if self.use_eq else 0
 
     def __len__(self):
         return len(self.utts)
 
     def __getitem__(self, idx) -> UtteranceTensors:
         utt = self.utts[idx]
+        eq_audio: Optional[FloatTensor] = None
+        eq_params: Optional[FloatTensor] = None
+
+        audio_data = torch.load(utt.audio_norm_path)
+
+        if self.use_eq:
+            # audio_data is [N, T] stacked; profile 0 = clean, 1+ = EQ variants
+            audio_norm = audio_data[0]  # always clean for spec
+            eq_idx = torch.randint(0, self.num_eq_profiles, (1,)).item()
+            eq_audio = audio_data[eq_idx]
+            eq_params = FloatTensor(self.eq_audiogram_params[eq_idx])
+        else:
+            # audio_data is [T] (backward compatible)
+            audio_norm = audio_data
+
         return UtteranceTensors(
             phoneme_ids=torch.load(utt.phoneme_ids_path),
-            audio_norm=torch.load(utt.audio_norm_path),
+            audio_norm=audio_norm,
             spectrogram=torch.load(utt.audio_spec_path),
             speaker_id=(
                 LongTensor([utt.speaker_id]) if utt.speaker_id is not None else None
             ),
             text=utt.text,
+            eq_audio=eq_audio,
+            eq_params=eq_params,
         )
 
 
 class UtteranceCollate:
-    def __init__(self, is_multispeaker: bool, segment_size: int):
+    def __init__(
+        self,
+        is_multispeaker: bool,
+        segment_size: int,
+        use_eq: bool = False,
+    ):
         self.is_multispeaker = is_multispeaker
         self.segment_size = segment_size
+        self.use_eq = use_eq
 
     def __call__(self, utterances: Sequence[UtteranceTensors]) -> Batch:
         num_utterances = len(utterances)
@@ -624,6 +721,7 @@ class UtteranceCollate:
         max_phonemes_length = 0
         max_spec_length = 0
         max_audio_length = 0
+        max_eq_audio_length = 0
 
         num_mels = 0
 
@@ -640,12 +738,17 @@ class UtteranceCollate:
             max_spec_length = max(max_spec_length, spec_length)
             max_audio_length = max(max_audio_length, audio_length)
 
+            if self.use_eq and utt.eq_audio is not None:
+                eq_audio_length = utt.eq_audio.size(0)
+                max_eq_audio_length = max(max_eq_audio_length, eq_audio_length)
+
             num_mels = utt.spectrogram.size(0)
             if self.is_multispeaker:
                 assert utt.speaker_id is not None, "Missing speaker id"
 
         # Audio cannot be smaller than segment size (8192)
         max_audio_length = max(max_audio_length, self.segment_size)
+        max_eq_audio_length = max(max_eq_audio_length, self.segment_size)
 
         # Create padded tensors
         phonemes_padded = LongTensor(num_utterances, max_phonemes_length)
@@ -659,6 +762,16 @@ class UtteranceCollate:
         phoneme_lengths = LongTensor(num_utterances)
         spec_lengths = LongTensor(num_utterances)
         audio_lengths = LongTensor(num_utterances)
+
+        # EQ tensors
+        eq_audio_padded: Optional[FloatTensor] = None
+        eq_params_padded: Optional[FloatTensor] = None
+        if self.use_eq:
+            eq_audio_padded = FloatTensor(num_utterances, 1, max_eq_audio_length)
+            eq_audio_padded.zero_()
+            n_bands = len(utterances[0].eq_params) if utterances[0].eq_params is not None else 6
+            eq_params_padded = FloatTensor(num_utterances, n_bands)
+            eq_params_padded.zero_()
 
         speaker_ids: Optional[LongTensor] = None
         if self.is_multispeaker:
@@ -683,6 +796,17 @@ class UtteranceCollate:
             audio_padded[utt_idx, :, :audio_length] = utt.audio_norm
             audio_lengths[utt_idx] = audio_length
 
+            # EQ audio
+            if self.use_eq and utt.eq_audio is not None:
+                assert eq_audio_padded is not None
+                eq_audio_length = utt.eq_audio.size(0)
+                eq_audio_padded[utt_idx, :, :eq_audio_length] = utt.eq_audio
+
+            # EQ params
+            if self.use_eq and utt.eq_params is not None:
+                assert eq_params_padded is not None
+                eq_params_padded[utt_idx] = utt.eq_params
+
             if utt.speaker_id is not None:
                 assert speaker_ids is not None
                 speaker_ids[utt_idx] = utt.speaker_id
@@ -695,4 +819,6 @@ class UtteranceCollate:
             audios=audio_padded,
             audio_lengths=audio_lengths,
             speaker_ids=speaker_ids,
+            eq_audios=eq_audio_padded,
+            eq_params=eq_params_padded,
         )

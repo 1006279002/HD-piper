@@ -77,6 +77,11 @@ class ModelConfig:
     use_sdp: bool = True  # StochasticDurationPredictor
     segment_size: int = 8192
 
+    # EQ conditioning
+    use_eq_conditioning: bool = False
+    n_eq_bands: int = 6
+    eq_cond_dim: int = 256
+
     @property
     def is_multispeaker(self) -> bool:
         return self.n_speakers > 1

@@ -309,6 +309,7 @@ class Generator(torch.nn.Module):
         upsample_initial_channel: int,
         upsample_kernel_sizes: typing.Tuple[int, ...],
         gin_channels: int = 0,
+        eq_cond_dim: int = 0,
     ):
         super(Generator, self).__init__()
         self.LRELU_SLOPE = 0.1
@@ -348,10 +349,15 @@ class Generator(torch.nn.Module):
         if gin_channels != 0:
             self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
 
-    def forward(self, x, g=None):
+        if eq_cond_dim != 0:
+            self.eq_cond = nn.Conv1d(eq_cond_dim, upsample_initial_channel, 1)
+
+    def forward(self, x, g=None, eq_cond=None):
         x = self.conv_pre(x)
         if g is not None:
             x = x + self.cond(g)
+        if eq_cond is not None:
+            x = x + self.eq_cond(eq_cond)
 
         for i, up in enumerate(self.ups):
             x = F.leaky_relu(x, self.LRELU_SLOPE)
@@ -547,6 +553,8 @@ class SynthesizerTrn(nn.Module):
         n_speakers: int = 1,
         gin_channels: int = 0,
         use_sdp: bool = True,
+        n_eq_bands: int = 6,
+        eq_cond_dim: int = 0,
     ):
 
         super().__init__()
@@ -568,8 +576,17 @@ class SynthesizerTrn(nn.Module):
         self.segment_size = segment_size
         self.n_speakers = n_speakers
         self.gin_channels = gin_channels
+        self.n_eq_bands = n_eq_bands
+        self.eq_cond_dim = eq_cond_dim
 
         self.use_sdp = use_sdp
+
+        # EQ parameter encoder (encodes dB gains → conditioning vector)
+        self.eq_encoder: typing.Optional[modules.EQParameterEncoder] = None
+        if eq_cond_dim > 0:
+            self.eq_encoder = modules.EQParameterEncoder(
+                n_bands=n_eq_bands, eq_cond_dim=eq_cond_dim
+            )
 
         self.enc_p = TextEncoder(
             n_vocab,
@@ -590,6 +607,7 @@ class SynthesizerTrn(nn.Module):
             upsample_initial_channel,
             upsample_kernel_sizes,
             gin_channels=gin_channels,
+            eq_cond_dim=eq_cond_dim,
         )
         self.enc_q = PosteriorEncoder(
             spec_channels,
@@ -616,7 +634,7 @@ class SynthesizerTrn(nn.Module):
         if n_speakers > 1:
             self.emb_g = nn.Embedding(n_speakers, gin_channels)
 
-    def forward(self, x, x_lengths, y, y_lengths, sid=None):
+    def forward(self, x, x_lengths, y, y_lengths, sid=None, eq_params=None):
         # Import here so we can avoid building the module for inference only
         from . import monotonic_align
 
@@ -625,6 +643,11 @@ class SynthesizerTrn(nn.Module):
             g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
         else:
             g = None
+
+        # Encode EQ parameters into conditioning vector
+        eq_cond: typing.Optional[torch.Tensor] = None
+        if (self.eq_encoder is not None) and (eq_params is not None):
+            eq_cond = self.eq_encoder(eq_params)  # [B, eq_cond_dim, 1]
 
         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
         z_p = self.flow(z, y_mask, g=g)
@@ -671,7 +694,7 @@ class SynthesizerTrn(nn.Module):
         z_slice, ids_slice = commons.rand_slice_segments(
             z, y_lengths, self.segment_size
         )
-        o = self.dec(z_slice, g=g)
+        o = self.dec(z_slice, g=g, eq_cond=eq_cond)
         return (
             o,
             l_length,
@@ -687,6 +710,7 @@ class SynthesizerTrn(nn.Module):
         x,
         x_lengths,
         sid=None,
+        eq_params=None,
         noise_scale=0.667,
         length_scale=1,
         noise_scale_w=0.8,
@@ -698,6 +722,11 @@ class SynthesizerTrn(nn.Module):
             g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
         else:
             g = None
+
+        # Encode EQ parameters into conditioning vector
+        eq_cond: typing.Optional[torch.Tensor] = None
+        if (self.eq_encoder is not None) and (eq_params is not None):
+            eq_cond = self.eq_encoder(eq_params)  # [B, eq_cond_dim, 1]
 
         if self.use_sdp:
             logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
@@ -721,7 +750,7 @@ class SynthesizerTrn(nn.Module):
 
         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
         z = self.flow(z_p, y_mask, g=g, reverse=True)
-        o = self.dec((z * y_mask)[:, :, :max_len], g=g)
+        o = self.dec((z * y_mask)[:, :, :max_len], g=g, eq_cond=eq_cond)
 
         return o, attn, y_mask, (z, z_p, m_p, logs_p)
 

@@ -526,3 +526,36 @@ class ConvFlow(nn.Module):
             return x, logdet
         else:
             return x
+
+
+class EQParameterEncoder(nn.Module):
+    """Encodes hearing loss EQ parameters (dB gains at fixed frequency bands)
+    into a conditioning vector for the HiFi-GAN generator.
+
+    Input:  [B, n_bands] — dB gain values at standard audiometric frequencies
+            (typical range 0-120 dB HL)
+    Output: [B, eq_cond_dim, 1] — conditioning vector injected into generator
+
+    Normalization: input dB values are divided by 120.0 to map to roughly [0, 1]
+    before passing through the MLP encoder.
+    """
+
+    def __init__(self, n_bands: int = 6, eq_cond_dim: int = 256):
+        super().__init__()
+        self.n_bands = n_bands
+        self.eq_cond_dim = eq_cond_dim
+
+        self.encoder = nn.Sequential(
+            nn.Linear(n_bands, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, eq_cond_dim),
+        )
+
+    def forward(self, eq_params: torch.Tensor) -> torch.Tensor:
+        # eq_params: [B, n_bands]  dB HL values (0 = normal, up to ~120 = profound)
+        # Normalize to [0, 1] range by dividing by max hearing loss
+        eq_params_normalized = eq_params / 120.0
+        h = self.encoder(eq_params_normalized)  # [B, eq_cond_dim]
+        return h.unsqueeze(-1)  # [B, eq_cond_dim, 1]

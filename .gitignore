@@ -34,3 +34,7 @@ neil_export/
 .vscode/
 
 outputs/
+
+tool/
+
+._.DS_Store
