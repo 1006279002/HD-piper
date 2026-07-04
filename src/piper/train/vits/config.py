@@ -81,6 +81,7 @@ class ModelConfig:
     use_eq_conditioning: bool = False
     n_eq_bands: int = 6
     eq_cond_dim: int = 256
+    eq_freq_bands_hz: Optional[Tuple[float, ...]] = None
 
     @property
     def is_multispeaker(self) -> bool:

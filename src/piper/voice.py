@@ -476,6 +476,8 @@ class PiperVoice:
         length_scale = syn_config.length_scale
         noise_scale = syn_config.noise_scale
         noise_w_scale = syn_config.noise_w_scale
+        eq_params = syn_config.eq_params
+        eq_profile = syn_config.eq_profile
 
         if length_scale is None:
             length_scale = self.config.length_scale
@@ -510,6 +512,16 @@ class PiperVoice:
             sid = np.array([speaker_id], dtype=np.int64)
             args["sid"] = sid
 
+        input_metas = {
+            input_meta.name: input_meta for input_meta in self.session.get_inputs()
+        }
+        if "eq_params" in input_metas:
+            args["eq_params"] = self._get_eq_params_array(
+                eq_params,
+                eq_profile,
+                input_metas["eq_params"],
+            )
+
         # Synthesize through onnx
         result = self.session.run(
             None,
@@ -529,3 +541,52 @@ class PiperVoice:
         )
 
         return audio, phoneme_id_samples
+
+    def _get_eq_params_array(
+        self,
+        eq_params: Optional[Sequence[float]],
+        eq_profile: Optional[str],
+        eq_input_meta: Any,
+    ) -> np.ndarray:
+        """Resolve EQ/audiogram params for an EQ-conditioned ONNX model."""
+        eq_config = self.config.eq or {}
+        eq_profiles = eq_config.get("eq_profiles", {})
+
+        if eq_params is not None:
+            params = [float(value) for value in eq_params]
+        else:
+            profile_name = eq_profile or "EQ_0"
+            if profile_name not in eq_profiles:
+                if eq_profile is not None:
+                    available = ", ".join(sorted(eq_profiles)) or "none"
+                    raise ValueError(
+                        f"Unknown EQ profile '{profile_name}'. Available profiles: {available}"
+                    )
+
+                expected_bands = self._get_eq_input_band_count(eq_input_meta)
+                if expected_bands is None:
+                    raise ValueError(
+                        "This ONNX model requires eq_params. Pass --eq-params or use "
+                        "an EQ.onnx.json config with eq.eq_profiles."
+                    )
+                params = [0.0] * expected_bands
+            else:
+                params = [float(value) for value in eq_profiles[profile_name]]
+
+        expected_bands = eq_config.get("n_eq_bands")
+        if (expected_bands is not None) and (len(params) != int(expected_bands)):
+            raise ValueError(f"Expected {expected_bands} EQ params, got {len(params)}")
+
+        return np.asarray([params], dtype=np.float32)
+
+    @staticmethod
+    def _get_eq_input_band_count(eq_input_meta: Any) -> Optional[int]:
+        shape = getattr(eq_input_meta, "shape", None)
+        if not shape:
+            return None
+
+        last_dim = shape[-1]
+        if isinstance(last_dim, int):
+            return last_dim
+
+        return None

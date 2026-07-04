@@ -58,6 +58,9 @@ class PiperConfig:
     The final cluster phoneme must be present in the id map.
     """
 
+    eq: Optional[Mapping[str, Any]] = None
+    """Optional EQ/audiogram metadata for EQ-conditioned models."""
+
     @staticmethod
     def from_dict(config: dict[str, Any]) -> "PiperConfig":
         """Load configuration from a dictionary."""
@@ -84,6 +87,7 @@ class PiperConfig:
             vowel_clusters=(
                 {tuple(vc) for vc in vowel_clusters} if vowel_clusters else None
             ),
+            eq=config.get("eq"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -116,6 +120,9 @@ class PiperConfig:
                 list(vc) for vc in sorted(self.vowel_clusters)
             ]
 
+        if self.eq:
+            config_dict["eq"] = self.eq
+
         return config_dict
 
 
@@ -140,3 +147,9 @@ class SynthesisConfig:
 
     volume: float = 1.0
     """Multiplier for audio samples (< 1 is quieter, > 1 is louder)."""
+
+    eq_profile: Optional[str] = None
+    """EQ profile name from the voice config, such as EQ_0 or EQ_1."""
+
+    eq_params: Optional[Sequence[float]] = None
+    """Explicit EQ/audiogram dB HL values for EQ-conditioned models."""

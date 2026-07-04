@@ -211,11 +211,11 @@ class WN(torch.nn.Module):
 
     def remove_weight_norm(self):
         if self.gin_channels != 0:
-            remove_parametrizations(self.cond_layer, 'weight')
+            remove_parametrizations(self.cond_layer, "weight")
         for l in self.in_layers:
-            remove_parametrizations(l, 'weight')
+            remove_parametrizations(l, "weight")
         for l in self.res_skip_layers:
-            remove_parametrizations(l, 'weight')
+            remove_parametrizations(l, "weight")
 
 
 class ResBlock1(torch.nn.Module):
@@ -316,9 +316,9 @@ class ResBlock1(torch.nn.Module):
 
     def remove_weight_norm(self):
         for l in self.convs1:
-            remove_parametrizations(l, 'weight')
+            remove_parametrizations(l, "weight")
         for l in self.convs2:
-            remove_parametrizations(l, 'weight')
+            remove_parametrizations(l, "weight")
 
 
 class ResBlock2(torch.nn.Module):
@@ -366,7 +366,7 @@ class ResBlock2(torch.nn.Module):
 
     def remove_weight_norm(self):
         for l in self.convs:
-            remove_parametrizations(l, 'weight')
+            remove_parametrizations(l, "weight")
 
 
 class Log(nn.Module):
@@ -529,33 +529,134 @@ class ConvFlow(nn.Module):
 
 
 class EQParameterEncoder(nn.Module):
-    """Encodes hearing loss EQ parameters (dB gains at fixed frequency bands)
-    into a conditioning vector for the HiFi-GAN generator.
+    """Encodes audiogram hearing-loss values into a decoder conditioning vector.
 
-    Input:  [B, n_bands] — dB gain values at standard audiometric frequencies
-            (typical range 0-120 dB HL)
-    Output: [B, eq_cond_dim, 1] — conditioning vector injected into generator
+    Input:  [B, n_bands] — dB HL at audiogram frequencies.
+    Output: [B, eq_cond_dim, 1] — conditioning vector injected into generator.
 
-    Normalization: input dB values are divided by 120.0 to map to roughly [0, 1]
-    before passing through the MLP encoder.
+    The encoder first interpolates sparse audiogram points on a log-frequency
+    axis into a mel-bin hearing-loss curve. The curve is then normalized and
+    encoded with small 1-D convolutions, preserving the ordering and local
+    structure of the patient's hearing-loss profile.
     """
 
-    def __init__(self, n_bands: int = 6, eq_cond_dim: int = 256):
+    def __init__(
+        self,
+        n_bands: int = 6,
+        eq_cond_dim: int = 256,
+        mel_channels: int = 80,
+        sample_rate: int = 22050,
+        mel_fmin: float = 0.0,
+        mel_fmax: typing.Optional[float] = None,
+        freq_bands_hz: typing.Optional[typing.Sequence[float]] = None,
+    ):
         super().__init__()
         self.n_bands = n_bands
         self.eq_cond_dim = eq_cond_dim
+        self.mel_channels = mel_channels
 
-        self.encoder = nn.Sequential(
-            nn.Linear(n_bands, 64),
-            nn.ReLU(),
-            nn.Linear(64, 128),
-            nn.ReLU(),
-            nn.Linear(128, eq_cond_dim),
+        if freq_bands_hz is None:
+            freq_bands_hz = _default_audiogram_freqs(n_bands)
+        if len(freq_bands_hz) != n_bands:
+            raise ValueError(
+                f"Expected {n_bands} audiogram frequencies, got {len(freq_bands_hz)}"
+            )
+
+        interp_weights = _audiogram_to_mel_weights(
+            freq_bands_hz=freq_bands_hz,
+            mel_channels=mel_channels,
+            sample_rate=sample_rate,
+            mel_fmin=mel_fmin,
+            mel_fmax=mel_fmax,
+        )
+        self.register_buffer("interp_weights", interp_weights)
+
+        self.curve_encoder = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=5, padding=2, bias=False),
+            nn.GELU(),
+            nn.Conv1d(32, 64, kernel_size=5, padding=2, bias=False),
+            nn.GELU(),
+            nn.Conv1d(64, 64, kernel_size=5, padding=2, bias=False),
+            nn.GELU(),
+        )
+        self.proj = nn.Sequential(
+            nn.Linear(64 * mel_channels, eq_cond_dim, bias=False),
+            nn.GELU(),
+            nn.Linear(eq_cond_dim, eq_cond_dim, bias=False),
         )
 
     def forward(self, eq_params: torch.Tensor) -> torch.Tensor:
-        # eq_params: [B, n_bands]  dB HL values (0 = normal, up to ~120 = profound)
-        # Normalize to [0, 1] range by dividing by max hearing loss
-        eq_params_normalized = eq_params / 120.0
-        h = self.encoder(eq_params_normalized)  # [B, eq_cond_dim]
+        # eq_params: [B, n_bands] dB HL values (0 = normal hearing).
+        # Interpolate to a mel-bin hearing-loss curve and normalize dB HL.
+        mel_loss_curve = torch.matmul(eq_params.float(), self.interp_weights.t())
+        mel_loss_curve = mel_loss_curve / 120.0
+        h = self.curve_encoder(mel_loss_curve.unsqueeze(1))
+        h = self.proj(h.flatten(1))
         return h.unsqueeze(-1)  # [B, eq_cond_dim, 1]
+
+
+def _default_audiogram_freqs(n_bands: int) -> typing.Tuple[float, ...]:
+    if n_bands == 6:
+        return (250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0)
+
+    min_freq = math.log10(250.0)
+    max_freq = math.log10(8000.0)
+    return tuple(
+        10 ** (min_freq + (max_freq - min_freq) * i / max(1, n_bands - 1))
+        for i in range(n_bands)
+    )
+
+
+def _audiogram_to_mel_weights(
+    freq_bands_hz: typing.Sequence[float],
+    mel_channels: int,
+    sample_rate: int,
+    mel_fmin: float,
+    mel_fmax: typing.Optional[float],
+) -> torch.Tensor:
+    fmax = float(mel_fmax) if mel_fmax is not None else sample_rate / 2
+    mel_centers = _mel_center_frequencies(mel_channels, mel_fmin, fmax)
+    freq_bands = [float(freq) for freq in freq_bands_hz]
+    log_freqs = [math.log(max(freq, 1.0)) for freq in freq_bands]
+
+    weights = torch.zeros(mel_channels, len(freq_bands), dtype=torch.float32)
+    for mel_idx, mel_freq in enumerate(mel_centers):
+        if mel_freq <= freq_bands[0]:
+            weights[mel_idx, 0] = 1.0
+            continue
+        if mel_freq >= freq_bands[-1]:
+            weights[mel_idx, -1] = 1.0
+            continue
+
+        log_mel = math.log(max(mel_freq, 1.0))
+        right_idx = next(
+            idx for idx, freq in enumerate(freq_bands[1:], start=1) if mel_freq <= freq
+        )
+        left_idx = right_idx - 1
+        denom = max(log_freqs[right_idx] - log_freqs[left_idx], 1e-6)
+        alpha = (log_mel - log_freqs[left_idx]) / denom
+        weights[mel_idx, left_idx] = 1.0 - alpha
+        weights[mel_idx, right_idx] = alpha
+
+    return weights
+
+
+def _mel_center_frequencies(
+    mel_channels: int,
+    fmin: float,
+    fmax: float,
+) -> typing.List[float]:
+    mel_min = _hz_to_mel(max(float(fmin), 0.0))
+    mel_max = _hz_to_mel(float(fmax))
+    return [
+        _mel_to_hz(mel_min + (mel_max - mel_min) * (idx + 1) / (mel_channels + 1))
+        for idx in range(mel_channels)
+    ]
+
+
+def _hz_to_mel(freq: float) -> float:
+    return 2595.0 * math.log10(1.0 + freq / 700.0)
+
+
+def _mel_to_hz(mel: float) -> float:
+    return 700.0 * ((10.0 ** (mel / 2595.0)) - 1.0)

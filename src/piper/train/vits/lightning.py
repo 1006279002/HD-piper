@@ -3,6 +3,7 @@
 import ast
 import json
 import logging
+import math
 import operator
 from functools import reduce
 from pathlib import Path
@@ -78,6 +79,7 @@ class VitsModel(L.LightningModule):
         use_eq_conditioning: bool = False,
         n_eq_bands: int = 6,
         eq_cond_dim: int = 256,
+        eq_freq_bands_hz: Optional[tuple[float, ...]] = None,
         # unused
         dataset: object = None,
         **kwargs,
@@ -105,6 +107,15 @@ class VitsModel(L.LightningModule):
 
         if isinstance(self.hparams.betas, str):
             self.hparams.betas = ast.literal_eval(self.hparams.betas)
+
+        if isinstance(self.hparams.eq_freq_bands_hz, str):
+            self.hparams.eq_freq_bands_hz = ast.literal_eval(
+                self.hparams.eq_freq_bands_hz
+            )
+        if self.hparams.eq_freq_bands_hz is not None:
+            self.hparams.eq_freq_bands_hz = tuple(
+                float(freq) for freq in self.hparams.eq_freq_bands_hz
+            )
 
         expected_hop_length = reduce(operator.mul, self.hparams.upsample_rates, 1)
         if expected_hop_length != hop_length:
@@ -144,8 +155,17 @@ class VitsModel(L.LightningModule):
             n_speakers=self.hparams.num_speakers,
             gin_channels=self.hparams.gin_channels,
             use_sdp=self.hparams.use_sdp,
-            n_eq_bands=self.hparams.n_eq_bands if self.hparams.use_eq_conditioning else 6,
-            eq_cond_dim=self.hparams.eq_cond_dim if self.hparams.use_eq_conditioning else 0,
+            n_eq_bands=(
+                self.hparams.n_eq_bands if self.hparams.use_eq_conditioning else 6
+            ),
+            eq_cond_dim=(
+                self.hparams.eq_cond_dim if self.hparams.use_eq_conditioning else 0
+            ),
+            eq_mel_channels=self.hparams.mel_channels,
+            eq_sample_rate=self.hparams.sample_rate,
+            eq_mel_fmin=self.hparams.mel_fmin,
+            eq_mel_fmax=self.hparams.mel_fmax,
+            eq_freq_bands_hz=self.hparams.eq_freq_bands_hz,
         )
         self.model_d = MultiPeriodDiscriminator(
             use_spectral_norm=self.hparams.use_spectral_norm
@@ -169,7 +189,7 @@ class VitsModel(L.LightningModule):
 
     def load_state_dict(self, state_dict, strict=True, **kwargs):
         """Allow loading checkpoints that don't have EQ-related layers.
-        
+
         When use_eq_conditioning is enabled but the checkpoint was trained
         without EQ, the new EQ layers (eq_encoder, dec.eq_cond) are
         silently initialized randomly instead of raising an error.
@@ -192,6 +212,11 @@ class VitsModel(L.LightningModule):
 
         # EQ parameters for conditioning
         eq_params = batch.eq_params if self.hparams.use_eq_conditioning else None
+        target_audio = (
+            batch.target_audios
+            if self.hparams.use_eq_conditioning and batch.target_audios is not None
+            else y
+        )
 
         (
             y_hat,
@@ -201,21 +226,19 @@ class VitsModel(L.LightningModule):
             _x_mask,
             z_mask,
             (_z, z_p, m_p, logs_p, _m_q, logs_q),
-        ) = self.model_g(x, x_lengths, spec, spec_lengths, speaker_ids, eq_params=eq_params)
+        ) = self.model_g(
+            x, x_lengths, spec, spec_lengths, speaker_ids, eq_params=eq_params
+        )
 
-        mel = spec_to_mel_torch(
-            spec,
-            self.hparams.filter_length,
-            self.hparams.mel_channels,
-            self.hparams.sample_rate,
-            self.hparams.mel_fmin,
-            self.hparams.mel_fmax,
-        )
-        y_mel = slice_segments(
-            mel,
-            ids_slice,
-            self.hparams.segment_size // self.hparams.hop_length,
-        )
+        y_disc = slice_segments(
+            target_audio,
+            ids_slice * self.hparams.hop_length,
+            self.hparams.segment_size,
+        )  # slice
+
+        # Trim to avoid padding issues
+        y_hat = y_hat[..., : y_disc.shape[-1]]
+
         y_hat_mel = mel_spectrogram_torch(
             y_hat.squeeze(1),
             self.hparams.filter_length,
@@ -227,21 +250,33 @@ class VitsModel(L.LightningModule):
             self.hparams.mel_fmax,
         )
 
-        # Use EQ audio as discriminator real target when available
-        if self.hparams.use_eq_conditioning and batch.eq_audios is not None:
-            y_disc = batch.eq_audios  # EQ-processed audio
+        if self.hparams.use_eq_conditioning and batch.target_audios is not None:
+            y_mel = mel_spectrogram_torch(
+                y_disc.squeeze(1),
+                self.hparams.filter_length,
+                self.hparams.mel_channels,
+                self.hparams.sample_rate,
+                self.hparams.hop_length,
+                self.hparams.win_length,
+                self.hparams.mel_fmin,
+                self.hparams.mel_fmax,
+            )
         else:
-            y_disc = y
+            target_mel = spec_to_mel_torch(
+                spec,
+                self.hparams.filter_length,
+                self.hparams.mel_channels,
+                self.hparams.sample_rate,
+                self.hparams.mel_fmin,
+                self.hparams.mel_fmax,
+            )
+            y_mel = slice_segments(
+                target_mel,
+                ids_slice,
+                self.hparams.segment_size // self.hparams.hop_length,
+            )
 
-        y_disc = slice_segments(
-            y_disc,
-            ids_slice * self.hparams.hop_length,
-            self.hparams.segment_size,
-        )  # slice
-
-        # Trim to avoid padding issues
-        y_hat = y_hat[..., : y_disc.shape[-1]]
-
+        self._set_requires_grad(self.model_d, False)
         _y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.model_d(y_disc, y_hat)
 
         with autocast(self.device.type, enabled=False):
@@ -255,6 +290,7 @@ class VitsModel(L.LightningModule):
             loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
 
         # d step
+        self._set_requires_grad(self.model_d, True)
         y_d_hat_r, y_d_hat_g, _, _ = self.model_d(y_disc, y_hat.detach())
 
         with autocast(self.device.type, enabled=False):
@@ -266,6 +302,11 @@ class VitsModel(L.LightningModule):
 
         return loss_gen_all, loss_disc_all, loss_mel
 
+    @staticmethod
+    def _set_requires_grad(module: torch.nn.Module, requires_grad: bool):
+        for parameter in module.parameters():
+            parameter.requires_grad_(requires_grad)
+
     def training_step(self, batch: Batch, batch_idx: int):
         opt_g, opt_d = self.optimizers()
         loss_g, loss_d, loss_mel = self._compute_loss(batch)
@@ -273,12 +314,24 @@ class VitsModel(L.LightningModule):
         self.log("loss_g", loss_g, batch_size=self.batch_size)
         self.log("loss_mel", loss_mel, batch_size=self.batch_size)
         opt_g.zero_grad()
-        self.manual_backward(loss_g, retain_graph=True)
+        self.manual_backward(loss_g)
+        if self.hparams.grad_clip is not None:
+            self.clip_gradients(
+                opt_g,
+                gradient_clip_val=self.hparams.grad_clip,
+                gradient_clip_algorithm="norm",
+            )
         opt_g.step()
 
         self.log("loss_d", loss_d, batch_size=self.batch_size)
         opt_d.zero_grad()
         self.manual_backward(loss_d)
+        if self.hparams.grad_clip is not None:
+            self.clip_gradients(
+                opt_d,
+                gradient_clip_val=self.hparams.grad_clip,
+                gradient_clip_algorithm="norm",
+            )
         opt_d.step()
 
     def validation_step(self, batch: Batch, batch_idx: int):
@@ -298,16 +351,19 @@ class VitsModel(L.LightningModule):
             and hasattr(self.logger, "experiment")
             and hasattr(self.logger.experiment, "add_audio")
         ):
-            # EQ parameters for the two profiles
-            # EQ_0: clean audio (no EQ)
-            eq_params_0 = torch.zeros(1, 6, device=self.device)
-            # EQ_1: BASELINE audiogram [250:65, 500:70, 1000:70, 2000:65, 4000:75, 8000:90]
-            eq_params_1 = torch.tensor(
-                [[65.0, 70.0, 70.0, 65.0, 75.0, 90.0]],
-                device=self.device,
+            datamodule = self.trainer.datamodule
+            eq_profiles = (
+                datamodule.eq_audiogram_params
+                if self.hparams.use_eq_conditioning
+                else [[0.0] * self.hparams.n_eq_bands]
             )
 
-            for utt_idx, test_utt in enumerate(self.trainer.datamodule.test_dataset):
+            for utt_idx in range(len(datamodule.test_dataset)):
+                test_utt = self._get_dataset_utterance(
+                    datamodule.test_dataset,
+                    utt_idx,
+                    eq_idx=0 if self.hparams.use_eq_conditioning else None,
+                )
                 text = test_utt.phoneme_ids.unsqueeze(0).to(self.device)
                 text_lengths = torch.LongTensor([len(test_utt.phoneme_ids)]).to(
                     self.device
@@ -321,85 +377,6 @@ class VitsModel(L.LightningModule):
 
                 tag_base = test_utt.text or str(utt_idx)
 
-                # --- EQ_0: generate clean audio ---
-                audio_0 = self(
-                    text, text_lengths, scales, sid=sid, eq_params=eq_params_0
-                ).detach()
-                audio_0 = audio_0 * (1.0 / max(0.01, abs(audio_0).max()))
-
-                # --- EQ_1: generate EQ-compensated audio ---
-                audio_1 = self(
-                    text, text_lengths, scales, sid=sid, eq_params=eq_params_1
-                ).detach()
-                audio_1 = audio_1 * (1.0 / max(0.01, abs(audio_1).max()))
-
-                # Log audio samples
-                self.logger.experiment.add_audio(
-                    f"{tag_base}/EQ_0_clean",
-                    audio_0,
-                    sample_rate=self.hparams.sample_rate,
-                )
-                self.logger.experiment.add_audio(
-                    f"{tag_base}/EQ_1_baseline",
-                    audio_1,
-                    sample_rate=self.hparams.sample_rate,
-                )
-
-                # --- Compute mel spectrograms ---
-                mel_0 = mel_spectrogram_torch(
-                    audio_0.squeeze(1),
-                    self.hparams.filter_length,
-                    self.hparams.mel_channels,
-                    self.hparams.sample_rate,
-                    self.hparams.hop_length,
-                    self.hparams.win_length,
-                    self.hparams.mel_fmin,
-                    self.hparams.mel_fmax,
-                )  # [1, mel_channels, T]
-                mel_1 = mel_spectrogram_torch(
-                    audio_1.squeeze(1),
-                    self.hparams.filter_length,
-                    self.hparams.mel_channels,
-                    self.hparams.sample_rate,
-                    self.hparams.hop_length,
-                    self.hparams.win_length,
-                    self.hparams.mel_fmin,
-                    self.hparams.mel_fmax,
-                )  # [1, mel_channels, T]
-
-                # Ground truth mel from original audio (EQ_0) for reference
-                if test_utt.spectrogram is not None:
-                    gt_spec = test_utt.spectrogram.unsqueeze(0).to(self.device)
-                    gt_mel = spec_to_mel_torch(
-                        gt_spec,
-                        self.hparams.filter_length,
-                        self.hparams.mel_channels,
-                        self.hparams.sample_rate,
-                        self.hparams.mel_fmin,
-                        self.hparams.mel_fmax,
-                    )
-
-                    # Trim to matching length
-                    min_len = min(mel_0.size(-1), mel_1.size(-1), gt_mel.size(-1))
-                    mel_0_trim = mel_0[..., :min_len]
-                    mel_1_trim = mel_1[..., :min_len]
-                    gt_mel_trim = gt_mel[..., :min_len]
-
-                    # Mel loss vs ground truth
-                    mel_loss_0 = F.l1_loss(mel_0_trim, gt_mel_trim)
-                    mel_loss_1 = F.l1_loss(mel_1_trim, gt_mel_trim)
-
-                    self.logger.experiment.add_scalar(
-                        f"val_mel/{tag_base}_EQ_0_loss",
-                        mel_loss_0.item(),
-                        self.global_step,
-                    )
-                    self.logger.experiment.add_scalar(
-                        f"val_mel/{tag_base}_EQ_1_loss",
-                        mel_loss_1.item(),
-                        self.global_step,
-                    )
-
                 # Log mel spectrograms as images.
                 # Mel values are log-magnitude (e.g. [-12, 2]), so min-max
                 # normalize each spectrogram to [0,1] for proper visualization.
@@ -410,24 +387,96 @@ class VitsModel(L.LightningModule):
                         m = (m - m_min) / (m_max - m_min)
                     return m.unsqueeze(0)  # [1, mel, T]
 
-                self.logger.experiment.add_image(
-                    f"{tag_base}/mel_EQ_0",
-                    _norm_mel(mel_0),
-                    self.global_step,
-                )
-                self.logger.experiment.add_image(
-                    f"{tag_base}/mel_EQ_1",
-                    _norm_mel(mel_1),
-                    self.global_step,
-                )
-                if test_utt.spectrogram is not None:
+                for eq_idx, eq_profile in enumerate(eq_profiles):
+                    eq_params = (
+                        torch.tensor(
+                            [eq_profile],
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        if self.hparams.use_eq_conditioning
+                        else None
+                    )
+                    audio = self(
+                        text,
+                        text_lengths,
+                        scales,
+                        sid=sid,
+                        eq_params=eq_params,
+                    ).detach()
+                    mel = mel_spectrogram_torch(
+                        audio.squeeze(1),
+                        self.hparams.filter_length,
+                        self.hparams.mel_channels,
+                        self.hparams.sample_rate,
+                        self.hparams.hop_length,
+                        self.hparams.win_length,
+                        self.hparams.mel_fmin,
+                        self.hparams.mel_fmax,
+                    )
+                    target_utt = self._get_dataset_utterance(
+                        datamodule.test_dataset,
+                        utt_idx,
+                        eq_idx=eq_idx if self.hparams.use_eq_conditioning else None,
+                        load_target_spectrogram=True,
+                    )
+                    target_spec = (
+                        target_utt.target_spectrogram
+                        if self.hparams.use_eq_conditioning
+                        and target_utt.target_spectrogram is not None
+                        else target_utt.spectrogram
+                    )
+                    target_mel = spec_to_mel_torch(
+                        target_spec.unsqueeze(0).to(self.device),
+                        self.hparams.filter_length,
+                        self.hparams.mel_channels,
+                        self.hparams.sample_rate,
+                        self.hparams.mel_fmin,
+                        self.hparams.mel_fmax,
+                    )
+                    min_len = min(mel.size(-1), target_mel.size(-1))
+                    mel_loss = F.l1_loss(
+                        mel[..., :min_len],
+                        target_mel[..., :min_len],
+                    )
+
+                    self.logger.experiment.add_audio(
+                        f"{tag_base}/EQ_{eq_idx}",
+                        audio.squeeze(0),
+                        sample_rate=self.hparams.sample_rate,
+                    )
+                    self.logger.experiment.add_scalar(
+                        f"val_mel/{tag_base}_EQ_{eq_idx}_loss",
+                        mel_loss.item(),
+                        self.global_step,
+                    )
                     self.logger.experiment.add_image(
-                        f"{tag_base}/mel_GT",
-                        _norm_mel(gt_mel),
+                        f"{tag_base}/mel_EQ_{eq_idx}",
+                        _norm_mel(mel),
                         self.global_step,
                     )
 
         return super().on_validation_end()
+
+    @staticmethod
+    def _get_dataset_utterance(
+        dataset,
+        idx: int,
+        eq_idx: Optional[int] = None,
+        load_target_spectrogram: bool = False,
+    ):
+        while hasattr(dataset, "dataset") and hasattr(dataset, "indices"):
+            idx = dataset.indices[idx]
+            dataset = dataset.dataset
+
+        if hasattr(dataset, "get_utterance"):
+            return dataset.get_utterance(
+                idx,
+                eq_idx=eq_idx,
+                load_target_spectrogram=load_target_spectrogram,
+            )
+
+        return dataset[idx]
 
     def configure_optimizers(self):
         optimizers = [
@@ -487,6 +536,8 @@ class VitsModel(L.LightningModule):
 
     def on_fit_start(self):
         # Called once at the start of fit()
+        self._validate_eq_profiles()
+
         if self._vocoder_warmstart_ckpt is not None:
             # Make sure we're on the correct device
             self._warmstart_vocoder_from_ckpt(self._vocoder_warmstart_ckpt)
@@ -496,13 +547,60 @@ class VitsModel(L.LightningModule):
         # Save EQ-aware model config for ONNX export / inference reference
         self._save_eq_model_config()
 
+    def _validate_eq_profiles(self):
+        if not self.hparams.use_eq_conditioning:
+            return
+
+        datamodule = self.trainer.datamodule
+        eq_profiles = getattr(datamodule, "eq_audiogram_params", None)
+        if not eq_profiles:
+            raise ValueError("EQ conditioning requires at least one EQ profile")
+
+        n_bands = len(eq_profiles[0])
+        if n_bands != self.hparams.n_eq_bands:
+            raise ValueError(
+                "EQ profile band count does not match model.n_eq_bands: "
+                f"{n_bands} != {self.hparams.n_eq_bands}"
+            )
+        if (
+            self.hparams.eq_freq_bands_hz is not None
+            and len(self.hparams.eq_freq_bands_hz) != n_bands
+        ):
+            raise ValueError(
+                "eq_freq_bands_hz length must match the EQ profile band count: "
+                f"{len(self.hparams.eq_freq_bands_hz)} != {n_bands}"
+            )
+
+        for eq_idx, eq_profile in enumerate(eq_profiles):
+            if len(eq_profile) != n_bands:
+                raise ValueError(
+                    f"EQ_{eq_idx} has {len(eq_profile)} bands, expected {n_bands}"
+                )
+
+        if any(float(value) != 0.0 for value in eq_profiles[0]):
+            raise ValueError("EQ_0 is the clean profile and must contain only zeros")
+
     def _save_eq_model_config(self):
-        """Save model architecture config (including EQ) next to the Piper config."""
+        """Save an EQ-prefixed ONNX companion voice config."""
         datamodule = self.trainer.datamodule
         config_path = Path(datamodule.config_path)
-        eq_config_path = config_path.with_suffix(".eq.json")
+        eq_config_path = config_path.with_name("EQ.onnx.json")
+        eq_profiles = (
+            getattr(datamodule, "eq_audiogram_params", [])
+            if self.hparams.use_eq_conditioning
+            else []
+        )
+        freq_bands_hz = self._get_eq_freq_bands_hz()
 
-        eq_config = {
+        if getattr(datamodule, "piper_config", None) is not None:
+            config = datamodule.piper_config.to_dict()
+        elif config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        else:
+            config = {}
+
+        config["eq"] = {
             # Audio
             "sample_rate": self.hparams.sample_rate,
             "hop_length": self.hparams.hop_length,
@@ -524,24 +622,43 @@ class VitsModel(L.LightningModule):
             # You control EQ effect by passing different eq_params at inference time.
             "use_eq_conditioning": self.hparams.use_eq_conditioning,
             "n_eq_bands": self.hparams.n_eq_bands,
+            "n_eq_profiles": len(eq_profiles),
             "eq_cond_dim": self.hparams.eq_cond_dim,
+            "eq_profiles": {
+                f"EQ_{eq_idx}": eq_profile
+                for eq_idx, eq_profile in enumerate(eq_profiles)
+            },
             # What each of the 6 eq_params values means:
             "eq_params_interface": {
                 "description": "eq_params[i] = hearing loss (dB HL) at freq_bands_hz[i]",
-                "input_shape": [1, 6],
+                "input_shape": [1, self.hparams.n_eq_bands],
                 "value_range": "0 (normal hearing) to ~120 (profound loss)",
                 "normalization": "model divides input by eq_norm_factor (120.0) internally",
-                "freq_bands_hz": [250, 500, 1000, 2000, 4000, 8000],
+                "freq_bands_hz": freq_bands_hz,
                 "eq_norm_factor": 120.0,
-                "examples": {
-                    "clean_no_eq":     [0,  0,  0,  0,  0,  0],
-                    "baseline_mild":   [65, 70, 70, 65, 75, 90],
-                    "profound_loss":   [80, 90, 100, 105, 115, 120],
-                },
+                "embedding": "log-frequency interpolation to mel bins, then Conv1d curve encoder",
             },
         }
 
         eq_config_path.parent.mkdir(parents=True, exist_ok=True)
         with open(eq_config_path, "w", encoding="utf-8") as f:
-            json.dump(eq_config, f, ensure_ascii=False, indent=2)
-        _LOGGER.info(f"[EQ config] Saved to {eq_config_path}")
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        _LOGGER.info(f"[EQ ONNX config] Saved to {eq_config_path}")
+
+    def _get_eq_freq_bands_hz(self) -> list[float]:
+        if self.hparams.eq_freq_bands_hz is not None:
+            return [float(freq) for freq in self.hparams.eq_freq_bands_hz]
+
+        if self.hparams.n_eq_bands == 6:
+            return [250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0]
+
+        min_freq = math.log10(250.0)
+        max_freq = math.log10(8000.0)
+        return [
+            10
+            ** (
+                min_freq
+                + (max_freq - min_freq) * idx / max(1, self.hparams.n_eq_bands - 1)
+            )
+            for idx in range(self.hparams.n_eq_bands)
+        ]

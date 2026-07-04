@@ -87,6 +87,16 @@ def main() -> None:
     parser.add_argument(
         "--no-normalize", action="store_true", help="Don't normalize audio"
     )
+    parser.add_argument(
+        "--eq-profile",
+        "--eq_profile",
+        help="EQ profile from the model config, such as EQ_0 or EQ_1",
+    )
+    parser.add_argument(
+        "--eq-params",
+        "--eq_params",
+        help="Comma/space separated EQ audiogram dB HL values, e.g. 65,70,70,65,75,90",
+    )
     #
     parser.add_argument(
         "--data-dir",
@@ -146,7 +156,11 @@ def main() -> None:
 
     # Load voice
     _LOGGER.debug("Loading voice: '%s'", model_path)
-    voice = PiperVoice.load(model_path, use_cuda=args.cuda)
+    voice = PiperVoice.load(model_path, config_path=args.config, use_cuda=args.cuda)
+    eq_params = _parse_eq_params(args.eq_params)
+    if (eq_params is not None) and args.eq_profile:
+        raise ValueError("Use either --eq-profile or --eq-params, not both")
+
     syn_config = SynthesisConfig(
         speaker_id=args.speaker,
         length_scale=args.length_scale,
@@ -154,6 +168,8 @@ def main() -> None:
         noise_w_scale=args.noise_w_scale,
         normalize_audio=(not args.no_normalize),
         volume=args.volume,
+        eq_profile=args.eq_profile,
+        eq_params=eq_params,
     )
 
     wav_file: wave.Wave_write
@@ -247,6 +263,20 @@ def main() -> None:
             wav_file = wave.open(args.output_file, "wb")
             with wav_file:
                 lines_to_wav()
+
+
+# -----------------------------------------------------------------------------
+
+
+def _parse_eq_params(value):
+    if value is None:
+        return None
+
+    values = value.replace(",", " ").split()
+    if not values:
+        raise ValueError("--eq-params must contain at least one value")
+
+    return [float(item) for item in values]
 
 
 # -----------------------------------------------------------------------------

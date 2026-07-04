@@ -350,7 +350,19 @@ class Generator(torch.nn.Module):
             self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
 
         if eq_cond_dim != 0:
-            self.eq_cond = nn.Conv1d(eq_cond_dim, upsample_initial_channel, 1)
+            self.eq_cond = nn.Conv1d(
+                eq_cond_dim,
+                upsample_initial_channel,
+                1,
+                bias=False,
+            )
+            nn.init.zeros_(self.eq_cond.weight)
+            self.eq_films = nn.ModuleList()
+            for i in range(len(self.ups)):
+                ch = upsample_initial_channel // (2 ** (i + 1))
+                film = nn.Linear(eq_cond_dim, ch * 2, bias=False)
+                nn.init.zeros_(film.weight)
+                self.eq_films.append(film)
 
     def forward(self, x, g=None, eq_cond=None):
         x = self.conv_pre(x)
@@ -358,10 +370,16 @@ class Generator(torch.nn.Module):
             x = x + self.cond(g)
         if eq_cond is not None:
             x = x + self.eq_cond(eq_cond)
+            eq_vec = eq_cond.squeeze(-1)
+        else:
+            eq_vec = None
 
         for i, up in enumerate(self.ups):
             x = F.leaky_relu(x, self.LRELU_SLOPE)
             x = up(x)
+            if eq_vec is not None:
+                gamma, beta = self.eq_films[i](eq_vec).unsqueeze(-1).chunk(2, dim=1)
+                x = x * (1.0 + gamma) + beta
             xs = torch.zeros(1)
             for j, resblock in enumerate(self.resblocks):
                 index = j - (i * self.num_kernels)
@@ -378,7 +396,7 @@ class Generator(torch.nn.Module):
 
     def remove_weight_norm(self):
         for l in self.ups:
-            remove_parametrizations(l, 'weight')
+            remove_parametrizations(l, "weight")
         for l in self.resblocks:
             l.remove_weight_norm()
 
@@ -555,6 +573,11 @@ class SynthesizerTrn(nn.Module):
         use_sdp: bool = True,
         n_eq_bands: int = 6,
         eq_cond_dim: int = 0,
+        eq_mel_channels: int = 80,
+        eq_sample_rate: int = 22050,
+        eq_mel_fmin: float = 0.0,
+        eq_mel_fmax: typing.Optional[float] = None,
+        eq_freq_bands_hz: typing.Optional[typing.Sequence[float]] = None,
     ):
 
         super().__init__()
@@ -578,6 +601,7 @@ class SynthesizerTrn(nn.Module):
         self.gin_channels = gin_channels
         self.n_eq_bands = n_eq_bands
         self.eq_cond_dim = eq_cond_dim
+        self.eq_freq_bands_hz = eq_freq_bands_hz
 
         self.use_sdp = use_sdp
 
@@ -585,7 +609,13 @@ class SynthesizerTrn(nn.Module):
         self.eq_encoder: typing.Optional[modules.EQParameterEncoder] = None
         if eq_cond_dim > 0:
             self.eq_encoder = modules.EQParameterEncoder(
-                n_bands=n_eq_bands, eq_cond_dim=eq_cond_dim
+                n_bands=n_eq_bands,
+                eq_cond_dim=eq_cond_dim,
+                mel_channels=eq_mel_channels,
+                sample_rate=eq_sample_rate,
+                mel_fmin=eq_mel_fmin,
+                mel_fmax=eq_mel_fmax,
+                freq_bands_hz=eq_freq_bands_hz,
             )
 
         self.enc_p = TextEncoder(
