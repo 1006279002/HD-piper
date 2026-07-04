@@ -35,6 +35,12 @@ neil_export/
 
 outputs/
 
-tool/
+tool/*
+!tool/
+!tool/test-eq/
+!tool/test-eq/*.py
+!tool/test-eq/audioeq_v2/
+!tool/test-eq/audioeq_v2/*.py
+!tool/test-eq/audioeq_v2/README.md
 
 ._.DS_Store
