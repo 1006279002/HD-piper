@@ -77,9 +77,10 @@ class VitsModel(L.LightningModule):
         vocoder_warmstart_ckpt: Optional[str] = None,
         # EQ conditioning
         use_eq_conditioning: bool = False,
-        n_eq_bands: int = 6,
+        n_eq_bands: int = 8,
         eq_cond_dim: int = 256,
         eq_freq_bands_hz: Optional[tuple[float, ...]] = None,
+        eq_gain_norm_factor: float = 15.0,
         # unused
         dataset: object = None,
         **kwargs,
@@ -156,7 +157,7 @@ class VitsModel(L.LightningModule):
             gin_channels=self.hparams.gin_channels,
             use_sdp=self.hparams.use_sdp,
             n_eq_bands=(
-                self.hparams.n_eq_bands if self.hparams.use_eq_conditioning else 6
+                self.hparams.n_eq_bands if self.hparams.use_eq_conditioning else 8
             ),
             eq_cond_dim=(
                 self.hparams.eq_cond_dim if self.hparams.use_eq_conditioning else 0
@@ -166,6 +167,7 @@ class VitsModel(L.LightningModule):
             eq_mel_fmin=self.hparams.mel_fmin,
             eq_mel_fmax=self.hparams.mel_fmax,
             eq_freq_bands_hz=self.hparams.eq_freq_bands_hz,
+            eq_gain_norm_factor=self.hparams.eq_gain_norm_factor,
         )
         self.model_d = MultiPeriodDiscriminator(
             use_spectral_norm=self.hparams.use_spectral_norm
@@ -353,7 +355,7 @@ class VitsModel(L.LightningModule):
         ):
             datamodule = self.trainer.datamodule
             eq_profiles = (
-                datamodule.eq_audiogram_params
+                datamodule.eq_template_params
                 if self.hparams.use_eq_conditioning
                 else [[0.0] * self.hparams.n_eq_bands]
             )
@@ -552,7 +554,7 @@ class VitsModel(L.LightningModule):
             return
 
         datamodule = self.trainer.datamodule
-        eq_profiles = getattr(datamodule, "eq_audiogram_params", None)
+        eq_profiles = getattr(datamodule, "eq_template_params", None)
         if not eq_profiles:
             raise ValueError("EQ conditioning requires at least one EQ profile")
 
@@ -586,7 +588,7 @@ class VitsModel(L.LightningModule):
         config_path = Path(datamodule.config_path)
         eq_config_path = config_path.with_name("EQ.onnx.json")
         eq_profiles = (
-            getattr(datamodule, "eq_audiogram_params", [])
+            getattr(datamodule, "eq_template_params", [])
             if self.hparams.use_eq_conditioning
             else []
         )
@@ -628,15 +630,16 @@ class VitsModel(L.LightningModule):
                 f"EQ_{eq_idx}": eq_profile
                 for eq_idx, eq_profile in enumerate(eq_profiles)
             },
-            # What each of the 6 eq_params values means:
+            "eq_condition_type": "template_gain_curve",
+            # What each eq_params value means:
             "eq_params_interface": {
-                "description": "eq_params[i] = hearing loss (dB HL) at freq_bands_hz[i]",
+                "description": "eq_params[i] = template EQ gain in dB at freq_bands_hz[i]",
                 "input_shape": [1, self.hparams.n_eq_bands],
-                "value_range": "0 (normal hearing) to ~120 (profound loss)",
-                "normalization": "model divides input by eq_norm_factor (120.0) internally",
+                "value_range": "template gain dB, typically -20 to +15",
+                "normalization": "model divides input by eq_gain_norm_factor internally",
                 "freq_bands_hz": freq_bands_hz,
-                "eq_norm_factor": 120.0,
-                "embedding": "log-frequency interpolation to mel bins, then Conv1d curve encoder",
+                "eq_gain_norm_factor": self.hparams.eq_gain_norm_factor,
+                "embedding": "log-frequency interpolation to mel bins plus control-point MLP",
             },
         }
 
@@ -649,10 +652,10 @@ class VitsModel(L.LightningModule):
         if self.hparams.eq_freq_bands_hz is not None:
             return [float(freq) for freq in self.hparams.eq_freq_bands_hz]
 
-        if self.hparams.n_eq_bands == 6:
-            return [250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0]
+        if self.hparams.n_eq_bands == 8:
+            return [125.0, 250.0, 500.0, 1000.0, 2000.0, 3000.0, 4000.0, 8000.0]
 
-        min_freq = math.log10(250.0)
+        min_freq = math.log10(125.0)
         max_freq = math.log10(8000.0)
         return [
             10

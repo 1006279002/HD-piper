@@ -59,7 +59,7 @@ class PiperConfig:
     """
 
     eq: Optional[Mapping[str, Any]] = None
-    """Optional EQ/audiogram metadata for EQ-conditioned models."""
+    """Optional EQ/template metadata for EQ-conditioned models."""
 
     @staticmethod
     def from_dict(config: dict[str, Any]) -> "PiperConfig":
@@ -152,4 +152,4 @@ class SynthesisConfig:
     """EQ profile name from the voice config, such as EQ_0 or EQ_1."""
 
     eq_params: Optional[Sequence[float]] = None
-    """Explicit EQ/audiogram dB HL values for EQ-conditioned models."""
+    """Explicit template EQ gain dB values for EQ-conditioned models."""

@@ -29,6 +29,15 @@ from .utils import get_cache_id
 
 _LOGGER = logging.getLogger(__name__)
 VAD_SAMPLE_RATE = 16000
+DEFAULT_EQ_TEMPLATE_PARAMS: List[List[float]] = [
+    [0, 0, 0, 0, 0, 0, 0, 0],
+    [-1, 0, 1, 3, 5, 5, 4, 1],
+    [-1, 0, 1, 4, 7, 8, 7, 2],
+    [0, 1, 2, 4, 5, 5, 4, 1],
+    [-1, 0, 1, 3, 5, 7, 8, 2],
+    [1, 2, 2, 3, 4, 4, 3, 1],
+    [0, 1, 4, 6, 6, 4, 3, 0],
+]
 
 
 @dataclass
@@ -80,7 +89,7 @@ class VitsDataModule(L.LightningDataModule):
         vowel_clusters: Optional[str] = None,
         # EQ conditioning
         eq_audio_base_dir: Optional[Union[str, Path]] = None,
-        eq_audiogram_params: Optional[List[List[float]]] = None,
+        eq_template_params: Optional[List[List[float]]] = None,
         use_eq_conditioning: bool = False,
     ) -> None:
         super().__init__()
@@ -133,17 +142,14 @@ class VitsDataModule(L.LightningDataModule):
         if eq_audio_base_dir is not None:
             self.eq_audio_base_dir = Path(eq_audio_base_dir)
 
-        if eq_audiogram_params is not None:
-            self.eq_audiogram_params = eq_audiogram_params
+        if eq_template_params is not None:
+            self.eq_template_params = eq_template_params
         else:
-            # Default: 2 EQ profiles — EQ_0 (clean) + EQ_1 (single EQ treatment)
-            # Values are dB gains at frequencies [250, 500, 1000, 2000, 4000, 8000] Hz
-            self.eq_audiogram_params = [
-                [0, 0, 0, 0, 0, 0],  # EQ_0: no EQ (clean audio)
-                [65, 70, 70, 65, 75, 90],  # EQ_1: BASELINE
-            ]
+            # Default: EQ_0 clean + six TTS template gain curves.
+            # Frequencies are [125, 250, 500, 1k, 2k, 3k, 4k, 8k] Hz.
+            self.eq_template_params = DEFAULT_EQ_TEMPLATE_PARAMS
 
-        self.num_eq_profiles = len(self.eq_audiogram_params)
+        self.num_eq_profiles = len(self.eq_template_params)
         if (
             use_eq_conditioning
             and (self.num_eq_profiles > 1)
@@ -626,8 +632,8 @@ class VitsDataModule(L.LightningDataModule):
 
         full_dataset = VitsDataset(
             all_utts,
-            eq_audiogram_params=(
-                self.eq_audiogram_params if self.use_eq_conditioning else None
+            eq_template_params=(
+                self.eq_template_params if self.use_eq_conditioning else None
             ),
         )
 
@@ -826,14 +832,12 @@ class VitsDataset(Dataset):
     def __init__(
         self,
         utts: list[CachedUtterance],
-        eq_audiogram_params: Optional[List[List[float]]] = None,
+        eq_template_params: Optional[List[List[float]]] = None,
     ):
         self.utts = utts
-        self.eq_audiogram_params = eq_audiogram_params
-        self.use_eq = (eq_audiogram_params is not None) and (
-            len(eq_audiogram_params) > 0
-        )
-        self.num_eq_profiles = len(eq_audiogram_params) if self.use_eq else 0
+        self.eq_template_params = eq_template_params
+        self.use_eq = (eq_template_params is not None) and (len(eq_template_params) > 0)
+        self.num_eq_profiles = len(eq_template_params) if self.use_eq else 0
 
     def __len__(self):
         return len(self.utts)
@@ -869,7 +873,7 @@ class VitsDataset(Dataset):
                 target_audio = target_audio[0]
             if load_target_spectrogram:
                 target_spectrogram = torch.load(utt.eq_spec_paths[eq_idx])
-            eq_params = FloatTensor(self.eq_audiogram_params[eq_idx])
+            eq_params = FloatTensor(self.eq_template_params[eq_idx])
 
         return UtteranceTensors(
             phoneme_ids=torch.load(utt.phoneme_ids_path),

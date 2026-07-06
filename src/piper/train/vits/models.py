@@ -571,13 +571,14 @@ class SynthesizerTrn(nn.Module):
         n_speakers: int = 1,
         gin_channels: int = 0,
         use_sdp: bool = True,
-        n_eq_bands: int = 6,
+        n_eq_bands: int = 8,
         eq_cond_dim: int = 0,
         eq_mel_channels: int = 80,
         eq_sample_rate: int = 22050,
         eq_mel_fmin: float = 0.0,
         eq_mel_fmax: typing.Optional[float] = None,
         eq_freq_bands_hz: typing.Optional[typing.Sequence[float]] = None,
+        eq_gain_norm_factor: float = 15.0,
     ):
 
         super().__init__()
@@ -602,13 +603,14 @@ class SynthesizerTrn(nn.Module):
         self.n_eq_bands = n_eq_bands
         self.eq_cond_dim = eq_cond_dim
         self.eq_freq_bands_hz = eq_freq_bands_hz
+        self.eq_gain_norm_factor = eq_gain_norm_factor
 
         self.use_sdp = use_sdp
 
-        # EQ parameter encoder (encodes dB gains → conditioning vector)
-        self.eq_encoder: typing.Optional[modules.EQParameterEncoder] = None
+        # Template EQ gain encoder (encodes filter response control points)
+        self.eq_encoder: typing.Optional[modules.EQTemplateEncoder] = None
         if eq_cond_dim > 0:
-            self.eq_encoder = modules.EQParameterEncoder(
+            self.eq_encoder = modules.EQTemplateEncoder(
                 n_bands=n_eq_bands,
                 eq_cond_dim=eq_cond_dim,
                 mel_channels=eq_mel_channels,
@@ -616,6 +618,7 @@ class SynthesizerTrn(nn.Module):
                 mel_fmin=eq_mel_fmin,
                 mel_fmax=eq_mel_fmax,
                 freq_bands_hz=eq_freq_bands_hz,
+                gain_norm_factor=eq_gain_norm_factor,
             )
 
         self.enc_p = TextEncoder(
@@ -674,7 +677,7 @@ class SynthesizerTrn(nn.Module):
         else:
             g = None
 
-        # Encode EQ parameters into conditioning vector
+        # Encode template EQ gains into conditioning vector
         eq_cond: typing.Optional[torch.Tensor] = None
         if (self.eq_encoder is not None) and (eq_params is not None):
             eq_cond = self.eq_encoder(eq_params)  # [B, eq_cond_dim, 1]
@@ -753,7 +756,7 @@ class SynthesizerTrn(nn.Module):
         else:
             g = None
 
-        # Encode EQ parameters into conditioning vector
+        # Encode template EQ gains into conditioning vector
         eq_cond: typing.Optional[torch.Tensor] = None
         if (self.eq_encoder is not None) and (eq_params is not None):
             eq_cond = self.eq_encoder(eq_params)  # [B, eq_cond_dim, 1]

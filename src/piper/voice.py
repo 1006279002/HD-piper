@@ -548,7 +548,7 @@ class PiperVoice:
         eq_profile: Optional[str],
         eq_input_meta: Any,
     ) -> np.ndarray:
-        """Resolve EQ/audiogram params for an EQ-conditioned ONNX model."""
+        """Resolve template EQ gain params for an EQ-conditioned ONNX model."""
         eq_config = self.config.eq or {}
         eq_profiles = eq_config.get("eq_profiles", {})
 
@@ -566,7 +566,7 @@ class PiperVoice:
                 expected_bands = self._get_eq_input_band_count(eq_input_meta)
                 if expected_bands is None:
                     raise ValueError(
-                        "This ONNX model requires eq_params. Pass --eq-params or use "
+                        "This ONNX model requires template eq_params. Pass --eq-params or use "
                         "an EQ.onnx.json config with eq.eq_profiles."
                     )
                 params = [0.0] * expected_bands

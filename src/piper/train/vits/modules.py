@@ -528,16 +528,16 @@ class ConvFlow(nn.Module):
             return x
 
 
-class EQParameterEncoder(nn.Module):
-    """Encodes audiogram hearing-loss values into a decoder conditioning vector.
+class EQTemplateEncoder(nn.Module):
+    """Encodes template EQ gain curves into a decoder conditioning vector.
 
-    Input:  [B, n_bands] — dB HL at audiogram frequencies.
+    Input:  [B, n_bands] — template gain in dB at control frequencies.
     Output: [B, eq_cond_dim, 1] — conditioning vector injected into generator.
 
-    The encoder first interpolates sparse audiogram points on a log-frequency
-    axis into a mel-bin hearing-loss curve. The curve is then normalized and
-    encoded with small 1-D convolutions, preserving the ordering and local
-    structure of the patient's hearing-loss profile.
+    Template gains already describe the intended filter response. The encoder
+    keeps that geometry by interpolating sparse control points on a log-frequency
+    axis into a mel-bin gain curve, then combines a curve Conv1d path with a
+    compact MLP over the original control points.
     """
 
     def __init__(
@@ -549,20 +549,22 @@ class EQParameterEncoder(nn.Module):
         mel_fmin: float = 0.0,
         mel_fmax: typing.Optional[float] = None,
         freq_bands_hz: typing.Optional[typing.Sequence[float]] = None,
+        gain_norm_factor: float = 15.0,
     ):
         super().__init__()
         self.n_bands = n_bands
         self.eq_cond_dim = eq_cond_dim
         self.mel_channels = mel_channels
+        self.gain_norm_factor = max(float(gain_norm_factor), 1e-6)
 
         if freq_bands_hz is None:
-            freq_bands_hz = _default_audiogram_freqs(n_bands)
+            freq_bands_hz = _default_template_freqs(n_bands)
         if len(freq_bands_hz) != n_bands:
             raise ValueError(
-                f"Expected {n_bands} audiogram frequencies, got {len(freq_bands_hz)}"
+                f"Expected {n_bands} template frequencies, got {len(freq_bands_hz)}"
             )
 
-        interp_weights = _audiogram_to_mel_weights(
+        interp_weights = _template_to_mel_weights(
             freq_bands_hz=freq_bands_hz,
             mel_channels=mel_channels,
             sample_rate=sample_rate,
@@ -579,27 +581,33 @@ class EQParameterEncoder(nn.Module):
             nn.Conv1d(64, 64, kernel_size=5, padding=2, bias=False),
             nn.GELU(),
         )
+        self.band_encoder = nn.Sequential(
+            nn.Linear(n_bands, eq_cond_dim, bias=False),
+            nn.GELU(),
+            nn.Linear(eq_cond_dim, eq_cond_dim, bias=False),
+            nn.GELU(),
+        )
         self.proj = nn.Sequential(
-            nn.Linear(64 * mel_channels, eq_cond_dim, bias=False),
+            nn.Linear(64 * mel_channels + eq_cond_dim, eq_cond_dim, bias=False),
             nn.GELU(),
             nn.Linear(eq_cond_dim, eq_cond_dim, bias=False),
         )
 
     def forward(self, eq_params: torch.Tensor) -> torch.Tensor:
-        # eq_params: [B, n_bands] dB HL values (0 = normal hearing).
-        # Interpolate to a mel-bin hearing-loss curve and normalize dB HL.
-        mel_loss_curve = torch.matmul(eq_params.float(), self.interp_weights.t())
-        mel_loss_curve = mel_loss_curve / 120.0
-        h = self.curve_encoder(mel_loss_curve.unsqueeze(1))
-        h = self.proj(h.flatten(1))
+        # eq_params: [B, n_bands] template gains in dB.
+        normalized_bands = eq_params.float() / self.gain_norm_factor
+        mel_gain_curve = torch.matmul(normalized_bands, self.interp_weights.t())
+        curve_h = self.curve_encoder(mel_gain_curve.unsqueeze(1)).flatten(1)
+        band_h = self.band_encoder(normalized_bands)
+        h = self.proj(torch.cat([curve_h, band_h], dim=1))
         return h.unsqueeze(-1)  # [B, eq_cond_dim, 1]
 
 
-def _default_audiogram_freqs(n_bands: int) -> typing.Tuple[float, ...]:
-    if n_bands == 6:
-        return (250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0)
+def _default_template_freqs(n_bands: int) -> typing.Tuple[float, ...]:
+    if n_bands == 8:
+        return (125.0, 250.0, 500.0, 1000.0, 2000.0, 3000.0, 4000.0, 8000.0)
 
-    min_freq = math.log10(250.0)
+    min_freq = math.log10(125.0)
     max_freq = math.log10(8000.0)
     return tuple(
         10 ** (min_freq + (max_freq - min_freq) * i / max(1, n_bands - 1))
@@ -607,7 +615,7 @@ def _default_audiogram_freqs(n_bands: int) -> typing.Tuple[float, ...]:
     )
 
 
-def _audiogram_to_mel_weights(
+def _template_to_mel_weights(
     freq_bands_hz: typing.Sequence[float],
     mel_channels: int,
     sample_rate: int,

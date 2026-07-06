@@ -95,7 +95,9 @@ def main() -> None:
     parser.add_argument(
         "--eq-params",
         "--eq_params",
-        help="Comma/space separated EQ audiogram dB HL values, e.g. 65,70,70,65,75,90",
+        help=(
+            "Comma/space separated template EQ gain dB values, " "e.g. -1,0,1,3,5,5,4,1"
+        ),
     )
     #
     parser.add_argument(
