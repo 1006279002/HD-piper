@@ -132,10 +132,21 @@ def design_fir_filter(sample_rate, gains_db, freq_points, num_taps=257,
         mp_taps = None
         for method in ('homomorphic', 'hilbert'):
             try:
-                candidate = signal.minimum_phase(linear_taps, method=method)
+                # SciPy's historical default is half=True, which creates a
+                # half-length filter with approximately sqrt(|H|). In dB this
+                # halves the requested EQ curve. For template training targets
+                # we need the designed magnitude response, so require half=False.
+                candidate = signal.minimum_phase(
+                    linear_taps, method=method, half=False
+                )
                 if candidate is not None and not np.any(np.isnan(candidate)):
                     mp_taps = candidate
                     break
+            except TypeError:
+                # Older SciPy versions do not expose half=False. Falling back
+                # to their default would silently weaken the EQ curve, so keep
+                # the linear-phase filter instead.
+                continue
             except Exception:
                 continue
         if mp_taps is not None:

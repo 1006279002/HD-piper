@@ -111,7 +111,7 @@ def main() -> None:
     parser.add_argument(
         "--debug", action="store_true", help="Print DEBUG messages to console"
     )
-    args, unknown_args = parser.parse_known_args()
+    args, unknown_args = parser.parse_known_args(_normalize_eq_params_argv(sys.argv[1:]))
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     _LOGGER.debug(args)
 
@@ -268,6 +268,41 @@ def main() -> None:
 
 
 # -----------------------------------------------------------------------------
+
+
+def _normalize_eq_params_argv(argv):
+    """Allow --eq-params -1,0,1,... without argparse treating it as an option."""
+    normalized = []
+    idx = 0
+    while idx < len(argv):
+        arg = argv[idx]
+        if (
+            arg in ("--eq-params", "--eq_params")
+            and (idx + 1) < len(argv)
+            and _looks_like_eq_params_value(argv[idx + 1])
+        ):
+            normalized.append(f"{arg}={argv[idx + 1]}")
+            idx += 2
+            continue
+
+        normalized.append(arg)
+        idx += 1
+
+    return normalized
+
+
+def _looks_like_eq_params_value(value):
+    values = value.replace(",", " ").split()
+    if not values:
+        return False
+
+    try:
+        for item in values:
+            float(item)
+    except ValueError:
+        return False
+
+    return True
 
 
 def _parse_eq_params(value):

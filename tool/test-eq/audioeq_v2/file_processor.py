@@ -64,7 +64,8 @@ def process_audio_array(audio, sample_rate, template, strength=1.0,
                         ng_threshold_db=-50, ng_ratio=4.0, ng_attack_ms=5,
                         ng_release_ms=100, ng_makeup_gain_db=0.0,
                         blocksize=16000, apply_limiter=True,
-                        max_gain=15.0, normalize_broadband=True):
+                        max_gain=15.0, normalize_broadband=True,
+                        peak_normalize=False):
     """
     对音频数组进行离线EQ处理。
 
@@ -79,10 +80,12 @@ def process_audio_array(audio, sample_rate, template, strength=1.0,
         low_cut_db/mid_gain_db/high_gain_db: float，高中低频调节
         ng_*: 噪声门参数
         blocksize: int，分块处理大小
-        apply_limiter: bool，是否应用输出限幅
+        apply_limiter: bool，是否应用输出限幅器
         max_gain: float，单频段最大增益（默认15dB）
         normalize_broadband: bool，是否归一化宽带增益（默认True，
             听力补偿场景应设为False）
+        peak_normalize: bool，是否对整段音频做峰值归一化到0.95。
+            训练EQ目标音频时建议False，避免抹掉模板间整体增益差异。
 
     返回：
         np.ndarray，处理后的音频（与输入形状一致，float32）
@@ -111,7 +114,8 @@ def process_audio_array(audio, sample_rate, template, strength=1.0,
             ng_threshold_db=ng_threshold_db, ng_ratio=ng_ratio,
             ng_attack_ms=ng_attack_ms, ng_release_ms=ng_release_ms,
             ng_makeup_gain_db=ng_makeup_gain_db,
-            max_gain=max_gain, normalize_broadband=normalize_broadband
+            max_gain=max_gain, normalize_broadband=normalize_broadband,
+            limiter_enabled=apply_limiter
         )
         processors.append(proc)
 
@@ -125,8 +129,8 @@ def process_audio_array(audio, sample_rate, template, strength=1.0,
             out_block = processors[ch].process(block, channel_idx=0)
             output[start:end, ch] = out_block
 
-    # 输出限幅（对整段统一处理，避免逐块限幅导致音量跳变）
-    if apply_limiter:
+    # 可选整段峰值归一化。默认关闭，避免训练目标之间的LTAS幅度差被拉平。
+    if peak_normalize:
         output = safe_limiter(output)
 
     if squeeze_output:

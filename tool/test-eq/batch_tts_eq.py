@@ -6,6 +6,7 @@ audioeq_v2.presets.
 """
 
 import argparse
+import importlib
 import os
 import runpy
 import sys
@@ -90,12 +91,51 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable final limiter.",
     )
+    parser.add_argument(
+        "--minimum-phase",
+        action="store_true",
+        help=(
+            "Use minimum-phase FIR. Default is linear-phase because this script "
+            "generates offline training targets where magnitude accuracy matters."
+        ),
+    )
+    parser.add_argument(
+        "--peak-normalize",
+        action="store_true",
+        help=(
+            "Peak-normalize each output file to 0.95. Disabled by default to "
+            "preserve LTAS/amplitude differences between EQ templates."
+        ),
+    )
     return parser.parse_args()
 
 
 def collect_wavs(input_dir: Path, recursive: bool) -> List[Path]:
     pattern = "**/*.wav" if recursive else "*.wav"
     return sorted(path for path in input_dir.glob(pattern) if path.is_file())
+
+
+def check_dependencies() -> bool:
+    missing: List[str] = []
+    for module_name in ("numpy", "soundfile", "scipy"):
+        try:
+            importlib.import_module(module_name)
+        except ImportError:
+            missing.append(module_name)
+
+    if missing:
+        print(
+            "[error] missing Python dependencies: " + ", ".join(missing),
+            file=sys.stderr,
+        )
+        print(
+            "[error] run this script with the same server environment used for audio "
+            "processing, or install: numpy soundfile scipy",
+            file=sys.stderr,
+        )
+        return False
+
+    return True
 
 
 def process_one(task: Dict[str, Any]) -> Dict[str, Any]:
@@ -124,11 +164,12 @@ def process_one(task: Dict[str, Any]) -> Dict[str, Any]:
         template,
         strength=task["strength"],
         num_taps=task["num_taps"],
-        use_minimum_phase=True,
+        use_minimum_phase=task["use_minimum_phase"],
         blocksize=task["blocksize"],
         apply_limiter=task["apply_limiter"],
         max_gain=task["max_gain"],
         normalize_broadband=False,
+        peak_normalize=task["peak_normalize"],
     )
 
     sf.write(output_path, output, sample_rate)
@@ -155,8 +196,10 @@ def build_tasks(
                     "strength": strength,
                     "max_gain": args.template_max_gain,
                     "num_taps": args.num_taps_template,
+                    "use_minimum_phase": args.minimum_phase,
                     "blocksize": args.blocksize,
                     "apply_limiter": not args.no_limiter,
+                    "peak_normalize": args.peak_normalize,
                     "force": args.force,
                 }
             )
@@ -173,6 +216,9 @@ def main() -> int:
     args = parse_args()
     args.input_dir = args.input_dir.resolve()
     args.output_root = args.output_root.resolve()
+
+    if not check_dependencies():
+        return 1
 
     if not args.input_dir.is_dir():
         print(f"[error] input dir does not exist: {args.input_dir}", file=sys.stderr)

@@ -43,7 +43,7 @@ def print_templates():
     print("可用EQ模板：")
     print("-" * 70)
     for tpl in list_templates():
-        gains_str = " ".join(f"{g:+d}" for g in tpl["gains"])
+        gains_str = " ".join(f"{g:+d}" for g in tpl['gains'])
         print(f"  [{tpl['id']:>2}] {tpl['name']:<8} ({tpl['category']})")
         print(f"       频段增益(125/250/500/1k/2k/3k/4k/8k): {gains_str}")
         print(f"       {tpl['desc']}")
@@ -117,13 +117,13 @@ def main():
         dest="normalize",
         action="store_true",
         default=None,
-        help="启用宽带增益归一化（模板模式默认开启）",
+        help="启用宽带增益归一化",
     )
     parser.add_argument(
         "--no-normalize",
         dest="normalize",
         action="store_false",
-        help="关闭宽带增益归一化（听力补偿模式默认关闭，保留补偿量）",
+        help="关闭宽带增益归一化（默认）",
     )
 
     # 音量与音色
@@ -187,7 +187,7 @@ def main():
             sys.exit(1)
     else:
         # 未指定则默认模板1
-        template_ref = args.template if args.template is not None else "1"
+        template_ref = args.template if args.template is not None else '1'
         try:
             template = get_template(template_ref)
         except ValueError as e:
@@ -212,8 +212,8 @@ def main():
     if args.normalize is not None:
         normalize_broadband = args.normalize
     else:
-        # 听力补偿模式默认关闭归一化（保留补偿量），模板模式默认开启
-        normalize_broadband = not audiogram_mode
+        # 离线生成训练/对比音频时默认关闭，保留模板之间的真实幅度差。
+        normalize_broadband = False
 
     # 读取音频
     try:
@@ -234,10 +234,8 @@ def main():
             f"EQ来源: 自定义听力图谱 (alpha={args.alpha}, max_gain={args.max_gain}dB)"
         )
         print(f"  听力图谱: {args.audiogram}")
-        gains_str = ", ".join(
-            f"{b}:{g:+.1f}" for b, g in zip(BAND_LABELS, template["gains"])
-        )
-        print(f"  计算增益(125/250/500/1k/2k/3k/4k/8k): {gains_str}")
+        gains_str = ", ".join(f"{b}:{g:+.1f}" for b, g in zip(BAND_LABELS, template['gains']))
+        print(f"  计算增益(250/500/1k/2k/3k/4k/8k): {gains_str}")
     else:
         print(f"EQ模板: [{template['id']}] {template['name']} ({template['category']})")
     print(f"强度档: {args.strength} (×{strength})")
