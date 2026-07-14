@@ -17,7 +17,8 @@ import numpy as np
 import torch
 from pysilero_vad import SileroVoiceActivityDetector
 from torch import FloatTensor, LongTensor
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 from piper.config import PhonemeType, PiperConfig
 from piper.phoneme_ids import DEFAULT_PHONEME_ID_MAP
@@ -38,6 +39,56 @@ DEFAULT_EQ_TEMPLATE_PARAMS: List[List[float]] = [
     [1, 2, 2, 3, 4, 4, 3, 1],
     [0, 1, 4, 6, 6, 4, 3, 0],
 ]
+DEFAULT_EQ_TEMPLATE_FREQS_HZ = (125.0, 250.0, 500.0, 1000.0, 2000.0, 3000.0, 4000.0, 8000.0)
+
+EQ_TARGET_CACHE_MODES = frozenset({"none", "audio"})
+
+
+def _match_audio_length(audio: FloatTensor, target_length: int) -> FloatTensor:
+    """Trim or zero-pad an audio tensor to match the clean profile length."""
+    audio_length = audio.size(0)
+    if audio_length == target_length:
+        return audio
+    if audio_length > target_length:
+        return audio[:target_length]
+    return torch.nn.functional.pad(audio, (0, target_length - audio_length))
+
+
+def _apply_trim_bounds(
+    audio_array: np.ndarray,
+    trim_bounds: Tuple[Optional[int], Optional[int]],
+    reference_num_samples: int,
+) -> np.ndarray:
+    """Apply clean-audio trim bounds to an aligned EQ target waveform."""
+    first_sample, last_sample = trim_bounds
+    if (first_sample is None) and (last_sample is None):
+        return audio_array
+
+    if len(audio_array) != reference_num_samples:
+        scale = len(audio_array) / max(1, reference_num_samples)
+        if first_sample is not None:
+            first_sample = int(math.floor(first_sample * scale))
+        if last_sample is not None:
+            last_sample = int(math.ceil(last_sample * scale))
+
+    return audio_array[first_sample:last_sample]
+
+
+def _load_eq_target_audio(
+    audio_path: Path,
+    sample_rate: int,
+    trim_bounds: Tuple[Optional[int], Optional[int]],
+    reference_num_samples: int,
+    target_num_samples: int,
+) -> FloatTensor:
+    """Load one EQ waveform and align it with the cached clean waveform."""
+    audio_array, _ = librosa.load(path=str(audio_path), sr=sample_rate, mono=True)
+    audio_array = _apply_trim_bounds(
+        audio_array,
+        trim_bounds,
+        reference_num_samples=reference_num_samples,
+    )
+    return _match_audio_length(torch.FloatTensor(audio_array), target_num_samples)
 
 
 @dataclass
@@ -45,8 +96,10 @@ class CachedUtterance:
     phoneme_ids_path: Path
     audio_norm_path: Path  # clean/profile 0 audio
     audio_spec_path: Path  # clean/profile 0 spectrogram
-    eq_audio_paths: Optional[List[Path]] = None  # profile index -> audio cache
-    eq_spec_paths: Optional[List[Path]] = None  # profile index -> spectrogram cache
+    eq_audio_source_paths: Optional[List[Path]] = None  # profiles 1..N -> source WAV
+    eq_audio_cache_paths: Optional[List[Path]] = None  # optional profiles 1..N cache
+    clean_trim_bounds: Tuple[Optional[int], Optional[int]] = (None, None)
+    clean_source_length: int = 0
     text: Optional[str] = None
     speaker_id: Optional[int] = None
 
@@ -90,6 +143,14 @@ class VitsDataModule(L.LightningDataModule):
         # EQ conditioning
         eq_audio_base_dir: Optional[Union[str, Path]] = None,
         eq_template_params: Optional[List[List[float]]] = None,
+        eq_target_cache: str = "none",
+        eq_random_profile_probability: float = 0.85,
+        eq_random_noise_std_db: float = 1.25,
+        eq_random_global_std_db: float = 0.5,
+        eq_random_tilt_std_db: float = 0.75,
+        eq_random_local_std_db: float = 1.5,
+        eq_random_min_gain_db: float = -8.0,
+        eq_random_max_gain_db: float = 15.0,
         use_eq_conditioning: bool = False,
     ) -> None:
         super().__init__()
@@ -150,6 +211,31 @@ class VitsDataModule(L.LightningDataModule):
             self.eq_template_params = DEFAULT_EQ_TEMPLATE_PARAMS
 
         self.num_eq_profiles = len(self.eq_template_params)
+        self.eq_target_cache = eq_target_cache.strip().lower()
+        if self.eq_target_cache not in EQ_TARGET_CACHE_MODES:
+            allowed = ", ".join(sorted(EQ_TARGET_CACHE_MODES))
+            raise ValueError(
+                f"eq_target_cache must be one of: {allowed} (got {eq_target_cache!r})"
+            )
+        self.eq_random_profile_probability = float(eq_random_profile_probability)
+        self.eq_random_noise_std_db = float(eq_random_noise_std_db)
+        self.eq_random_global_std_db = float(eq_random_global_std_db)
+        self.eq_random_tilt_std_db = float(eq_random_tilt_std_db)
+        self.eq_random_local_std_db = float(eq_random_local_std_db)
+        self.eq_random_min_gain_db = float(eq_random_min_gain_db)
+        self.eq_random_max_gain_db = float(eq_random_max_gain_db)
+        if not 0.0 <= self.eq_random_profile_probability <= 1.0:
+            raise ValueError("eq_random_profile_probability must be in [0, 1]")
+        if self.eq_random_noise_std_db < 0.0:
+            raise ValueError("eq_random_noise_std_db must be non-negative")
+        if self.eq_random_global_std_db < 0.0:
+            raise ValueError("eq_random_global_std_db must be non-negative")
+        if self.eq_random_tilt_std_db < 0.0:
+            raise ValueError("eq_random_tilt_std_db must be non-negative")
+        if self.eq_random_local_std_db < 0.0:
+            raise ValueError("eq_random_local_std_db must be non-negative")
+        if self.eq_random_min_gain_db > self.eq_random_max_gain_db:
+            raise ValueError("eq_random_min_gain_db must not exceed eq_random_max_gain_db")
         if (
             use_eq_conditioning
             and (self.num_eq_profiles > 1)
@@ -160,6 +246,13 @@ class VitsDataModule(L.LightningDataModule):
                 "one or more non-clean profiles"
             )
         self.use_eq_conditioning = use_eq_conditioning and (self.num_eq_profiles > 0)
+        if self.use_eq_conditioning and (self.eq_random_profile_probability > 0.0):
+            expected_bands = len(DEFAULT_EQ_TEMPLATE_FREQS_HZ)
+            if any(len(profile) != expected_bands for profile in self.eq_template_params):
+                raise ValueError(
+                    "Online random EQ profiles require the current 8-band template "
+                    f"layout ({expected_bands} values per profile)"
+                )
 
         # Phonemes
         if phoneme_type is None:
@@ -383,24 +476,24 @@ class VitsDataModule(L.LightningDataModule):
 
                 # normalized clean audio (profile 0)
                 norm_audio_path = self.cache_dir / f"{cache_id}.audio.pt"
+                trim_metadata_path = self.cache_dir / f"{cache_id}.trim.json"
                 audio_norm_tensor: Optional[torch.Tensor] = None
-
-                eq_audio_paths = [
-                    self.cache_dir / f"{cache_id}.audio_{eq_idx}.pt"
-                    for eq_idx in range(1, self.num_eq_profiles)
-                ]
-                eq_spec_paths = [
-                    self.cache_dir / f"{cache_id}.spec_{eq_idx}.pt"
-                    for eq_idx in range(1, self.num_eq_profiles)
-                ]
-                needs_eq_cache = self.use_eq_conditioning and any(
-                    (not audio_cache.exists()) or (not spec_cache.exists())
-                    for audio_cache, spec_cache in zip(eq_audio_paths, eq_spec_paths)
-                )
-                needs_clean_source = (not norm_audio_path.exists()) or needs_eq_cache
                 clean_trim_bounds: Tuple[Optional[int], Optional[int]] = (None, None)
                 clean_source_length: Optional[int] = None
-                force_clean_spec = False
+
+                if trim_metadata_path.exists():
+                    with trim_metadata_path.open("r", encoding="utf-8") as metadata_file:
+                        trim_metadata = json.load(metadata_file)
+                    clean_trim_bounds = (
+                        trim_metadata.get("first_sample"),
+                        trim_metadata.get("last_sample"),
+                    )
+                    clean_source_length = int(trim_metadata["source_num_samples"])
+
+                needs_clean_source = (
+                    (not norm_audio_path.exists()) or (clean_source_length is None)
+                )
+                refresh_clean_cache = needs_clean_source
 
                 if needs_clean_source:
                     audio_norm_array, audio_sample_rate = librosa.load(
@@ -428,22 +521,25 @@ class VitsDataModule(L.LightningDataModule):
 
                     audio_norm_tensor = torch.FloatTensor(audio_norm_array)
 
-                if not norm_audio_path.exists():
+                if refresh_clean_cache:
                     assert audio_norm_tensor is not None
                     torch.save(audio_norm_tensor, norm_audio_path)
-                    if report_prepare is None:
-                        report_prepare = True
-                elif needs_eq_cache and audio_norm_tensor is not None:
-                    # Refresh the clean cache when creating missing EQ caches so
-                    # every profile uses the same current trim/alignment policy.
-                    torch.save(audio_norm_tensor, norm_audio_path)
-                    force_clean_spec = True
+                    assert clean_source_length is not None
+                    with trim_metadata_path.open("w", encoding="utf-8") as metadata_file:
+                        json.dump(
+                            {
+                                "source_num_samples": clean_source_length,
+                                "first_sample": clean_trim_bounds[0],
+                                "last_sample": clean_trim_bounds[1],
+                            },
+                            metadata_file,
+                        )
                     if report_prepare is None:
                         report_prepare = True
 
                 # mel spectrogram (always from clean audio = profile 0)
                 audio_spec_path = self.cache_dir / f"{cache_id}.spec.pt"
-                if force_clean_spec or (not audio_spec_path.exists()):
+                if refresh_clean_cache or (not audio_spec_path.exists()):
                     if audio_norm_tensor is None:
                         audio_norm_tensor = torch.load(norm_audio_path)
 
@@ -470,58 +566,34 @@ class VitsDataModule(L.LightningDataModule):
 
                 if self.use_eq_conditioning and (self.num_eq_profiles > 1):
                     assert self.eq_audio_base_dir is not None
-                    if audio_norm_tensor is None:
-                        audio_norm_tensor = torch.load(norm_audio_path)
-                        if audio_norm_tensor.dim() == 2:
-                            audio_norm_tensor = audio_norm_tensor[0]
-                    clean_audio_length = audio_norm_tensor.size(0)
-
-                    for eq_idx, (eq_audio_path, eq_spec_path) in enumerate(
-                        zip(eq_audio_paths, eq_spec_paths), start=1
-                    ):
-                        if force_clean_spec or (not eq_audio_path.exists()):
-                            eq_audio_file = self._get_eq_audio_file(utt_id, eq_idx)
-                            if not eq_audio_file.exists():
-                                raise FileNotFoundError(
-                                    f"Missing EQ_{eq_idx} audio for {utt_id}: {eq_audio_file}"
-                                )
-
-                            eq_arr, _sr = librosa.load(
-                                path=str(eq_audio_file),
-                                sr=self.sample_rate,
-                                mono=True,
+                    for eq_idx in range(1, self.num_eq_profiles):
+                        eq_audio_file = self._get_eq_audio_file(utt_id, eq_idx)
+                        if not eq_audio_file.exists():
+                            raise FileNotFoundError(
+                                f"Missing EQ_{eq_idx} audio for {utt_id}: {eq_audio_file}"
                             )
-                            if self.trim_silence:
-                                if clean_source_length is None:
-                                    clean_source_length = len(eq_arr)
-                                eq_arr = self._apply_trim_bounds(
-                                    eq_arr,
-                                    clean_trim_bounds,
-                                    reference_num_samples=clean_source_length,
-                                )
 
-                            eq_tensor = torch.FloatTensor(eq_arr)
-                            eq_tensor = self._match_audio_length(
-                                eq_tensor,
-                                clean_audio_length,
-                            )
-                            torch.save(eq_tensor, eq_audio_path)
-                            if report_prepare is None:
-                                report_prepare = True
+                        if self.eq_target_cache != "audio":
+                            continue
 
-                        if force_clean_spec or (not eq_spec_path.exists()):
-                            eq_tensor = torch.load(eq_audio_path)
-                            torch.save(
-                                spectrogram_torch(
-                                    y=eq_tensor.unsqueeze(0),
-                                    n_fft=self.filter_length,
-                                    sampling_rate=self.sample_rate,
-                                    hop_size=self.hop_length,
-                                    win_size=self.win_length,
-                                    center=False,
-                                ).squeeze(0),
-                                eq_spec_path,
+                        eq_audio_cache_path = (
+                            self.cache_dir / f"{cache_id}.audio_{eq_idx}.pt"
+                        )
+                        if refresh_clean_cache or (not eq_audio_cache_path.exists()):
+                            if audio_norm_tensor is None:
+                                audio_norm_tensor = torch.load(norm_audio_path)
+                                if audio_norm_tensor.dim() == 2:
+                                    audio_norm_tensor = audio_norm_tensor[0]
+
+                            assert clean_source_length is not None
+                            eq_tensor = _load_eq_target_audio(
+                                eq_audio_file,
+                                sample_rate=self.sample_rate,
+                                trim_bounds=clean_trim_bounds,
+                                reference_num_samples=clean_source_length,
+                                target_num_samples=audio_norm_tensor.size(0),
                             )
+                            torch.save(eq_tensor, eq_audio_cache_path)
                             if report_prepare is None:
                                 report_prepare = True
 
@@ -594,24 +666,48 @@ class VitsDataModule(L.LightningDataModule):
                     )
                     continue
 
-                eq_audio_paths: Optional[List[Path]] = None
-                eq_spec_paths: Optional[List[Path]] = None
-                if self.use_eq_conditioning:
-                    eq_audio_paths = [audio_norm_path]
-                    eq_spec_paths = [audio_spec_path]
+                eq_audio_source_paths: Optional[List[Path]] = None
+                eq_audio_cache_paths: Optional[List[Path]] = None
+                clean_trim_bounds: Tuple[Optional[int], Optional[int]] = (None, None)
+                clean_source_length = 0
+                if self.use_eq_conditioning and (self.num_eq_profiles > 1):
+                    trim_metadata_path = self.cache_dir / f"{cache_id}.trim.json"
+                    if not trim_metadata_path.exists():
+                        raise FileNotFoundError(
+                            "Missing EQ trim metadata for "
+                            f"{audio_path}: {trim_metadata_path}. Re-run data preparation."
+                        )
+
+                    with trim_metadata_path.open("r", encoding="utf-8") as metadata_file:
+                        trim_metadata = json.load(metadata_file)
+                    clean_trim_bounds = (
+                        trim_metadata.get("first_sample"),
+                        trim_metadata.get("last_sample"),
+                    )
+                    clean_source_length = int(trim_metadata["source_num_samples"])
+
+                    assert self.eq_audio_base_dir is not None
+                    eq_audio_source_paths = []
+                    if self.eq_target_cache == "audio":
+                        eq_audio_cache_paths = []
                     for eq_idx in range(1, self.num_eq_profiles):
-                        eq_audio_path = self.cache_dir / f"{cache_id}.audio_{eq_idx}.pt"
-                        eq_spec_path = self.cache_dir / f"{cache_id}.spec_{eq_idx}.pt"
-                        if not eq_audio_path.exists():
+                        eq_audio_source_path = self._get_eq_audio_file(utt_id, eq_idx)
+                        if not eq_audio_source_path.exists():
                             raise FileNotFoundError(
-                                f"Missing cached EQ_{eq_idx} audio for {audio_path}: {eq_audio_path}"
+                                f"Missing EQ_{eq_idx} audio for {audio_path}: {eq_audio_source_path}"
                             )
-                        if not eq_spec_path.exists():
-                            raise FileNotFoundError(
-                                f"Missing cached EQ_{eq_idx} spectrogram for {audio_path}: {eq_spec_path}"
+                        eq_audio_source_paths.append(eq_audio_source_path)
+
+                        if eq_audio_cache_paths is not None:
+                            eq_audio_cache_path = (
+                                self.cache_dir / f"{cache_id}.audio_{eq_idx}.pt"
                             )
-                        eq_audio_paths.append(eq_audio_path)
-                        eq_spec_paths.append(eq_spec_path)
+                            if not eq_audio_cache_path.exists():
+                                raise FileNotFoundError(
+                                    "Missing cached EQ audio for "
+                                    f"{audio_path}: {eq_audio_cache_path}. Re-run data preparation."
+                                )
+                            eq_audio_cache_paths.append(eq_audio_cache_path)
 
                 text: Optional[str] = None
                 text_path = self.cache_dir / f"{cache_id}.txt"
@@ -623,8 +719,10 @@ class VitsDataModule(L.LightningDataModule):
                         phoneme_ids_path=phoneme_ids_path,
                         audio_norm_path=audio_norm_path,
                         audio_spec_path=audio_spec_path,
-                        eq_audio_paths=eq_audio_paths,
-                        eq_spec_paths=eq_spec_paths,
+                        eq_audio_source_paths=eq_audio_source_paths,
+                        eq_audio_cache_paths=eq_audio_cache_paths,
+                        clean_trim_bounds=clean_trim_bounds,
+                        clean_source_length=clean_source_length,
                         text=text,
                         speaker_id=speaker_id,
                     )
@@ -635,13 +733,35 @@ class VitsDataModule(L.LightningDataModule):
             eq_template_params=(
                 self.eq_template_params if self.use_eq_conditioning else None
             ),
+            sample_rate=self.sample_rate,
         )
 
         valid_set_size = int(len(full_dataset) * self.validation_split)
         train_set_size = len(full_dataset) - valid_set_size - self.num_test_examples
-        self.train_dataset, self.test_dataset, self.val_dataset = random_split(
+        train_indices, test_indices, val_indices = random_split(
             full_dataset, [train_set_size, self.num_test_examples, valid_set_size]
         )
+        train_dataset = VitsDataset(
+            all_utts,
+            eq_template_params=(
+                self.eq_template_params if self.use_eq_conditioning else None
+            ),
+            sample_rate=self.sample_rate,
+            random_profile_probability=(
+                self.eq_random_profile_probability
+                if self.use_eq_conditioning
+                else 0.0
+            ),
+            random_noise_std_db=self.eq_random_noise_std_db,
+            random_global_std_db=self.eq_random_global_std_db,
+            random_tilt_std_db=self.eq_random_tilt_std_db,
+            random_local_std_db=self.eq_random_local_std_db,
+            random_min_gain_db=self.eq_random_min_gain_db,
+            random_max_gain_db=self.eq_random_max_gain_db,
+        )
+        self.train_dataset = Subset(train_dataset, train_indices.indices)
+        self.test_dataset = Subset(full_dataset, test_indices.indices)
+        self.val_dataset = Subset(full_dataset, val_indices.indices)
 
     def train_dataloader(self):
         return self._make_dataloader(
@@ -703,13 +823,7 @@ class VitsDataModule(L.LightningDataModule):
 
     @staticmethod
     def _match_audio_length(audio: FloatTensor, target_length: int) -> FloatTensor:
-        """Trim or zero-pad an audio tensor to match the clean profile length."""
-        audio_length = audio.size(0)
-        if audio_length == target_length:
-            return audio
-        if audio_length > target_length:
-            return audio[:target_length]
-        return torch.nn.functional.pad(audio, (0, target_length - audio_length))
+        return _match_audio_length(audio, target_length)
 
     @staticmethod
     def _apply_trim_bounds(
@@ -717,18 +831,7 @@ class VitsDataModule(L.LightningDataModule):
         trim_bounds: Tuple[Optional[int], Optional[int]],
         reference_num_samples: int,
     ) -> np.ndarray:
-        first_sample, last_sample = trim_bounds
-        if (first_sample is None) and (last_sample is None):
-            return audio_array
-
-        if len(audio_array) != reference_num_samples:
-            scale = len(audio_array) / max(1, reference_num_samples)
-            if first_sample is not None:
-                first_sample = int(math.floor(first_sample * scale))
-            if last_sample is not None:
-                last_sample = int(math.ceil(last_sample * scale))
-
-        return audio_array[first_sample:last_sample]
+        return _apply_trim_bounds(audio_array, trim_bounds, reference_num_samples)
 
     def _get_trim_bounds(
         self,
@@ -805,7 +908,6 @@ class UtteranceTensors:
     speaker_id: Optional[LongTensor] = None
     text: Optional[str] = None
     target_audio: Optional[FloatTensor] = None
-    target_spectrogram: Optional[FloatTensor] = None
     eq_params: Optional[FloatTensor] = None  # [n_bands]
     eq_profile_id: Optional[int] = None
 
@@ -833,11 +935,117 @@ class VitsDataset(Dataset):
         self,
         utts: list[CachedUtterance],
         eq_template_params: Optional[List[List[float]]] = None,
+        sample_rate: int = 22050,
+        random_profile_probability: float = 0.0,
+        random_noise_std_db: float = 1.25,
+        random_global_std_db: float = 0.5,
+        random_tilt_std_db: float = 0.75,
+        random_local_std_db: float = 1.5,
+        random_min_gain_db: float = -8.0,
+        random_max_gain_db: float = 15.0,
     ):
         self.utts = utts
         self.eq_template_params = eq_template_params
         self.use_eq = (eq_template_params is not None) and (len(eq_template_params) > 0)
         self.num_eq_profiles = len(eq_template_params) if self.use_eq else 0
+        self.sample_rate = sample_rate
+        self.random_profile_probability = random_profile_probability
+        self.random_noise_std_db = random_noise_std_db
+        self.random_global_std_db = random_global_std_db
+        self.random_tilt_std_db = random_tilt_std_db
+        self.random_local_std_db = random_local_std_db
+        self.random_min_gain_db = random_min_gain_db
+        self.random_max_gain_db = random_max_gain_db
+
+        if self.random_profile_probability > 0.0:
+            assert self.eq_template_params is not None
+            if any(
+                len(profile) != len(DEFAULT_EQ_TEMPLATE_FREQS_HZ)
+                for profile in self.eq_template_params
+            ):
+                raise ValueError(
+                    "Random EQ profiles require the current 8-band template layout"
+                )
+
+    def _sample_random_eq_profile(self) -> FloatTensor:
+        """Interpolate template curves, then add smooth and local gain perturbations."""
+        assert self.eq_template_params is not None
+        template_profiles = torch.tensor(
+            self.eq_template_params,
+            dtype=torch.float32,
+        )
+        num_profiles, num_bands = template_profiles.shape
+
+        if num_profiles == 1 or torch.rand(()) < 0.6:
+            base_profile = template_profiles[torch.randint(num_profiles, ())]
+        else:
+            first_idx = torch.randint(num_profiles, ())
+            second_idx = torch.randint(num_profiles, ())
+            interpolation = torch.rand(())
+            base_profile = torch.lerp(
+                template_profiles[first_idx],
+                template_profiles[second_idx],
+                interpolation,
+            )
+
+        # Correlated per-band noise preserves the smooth geometry of an EQ curve.
+        smooth_noise = F.avg_pool1d(
+            torch.randn(1, 1, num_bands),
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        ).squeeze(0).squeeze(0)
+        smooth_noise = smooth_noise * self.random_noise_std_db
+
+        band_positions = torch.linspace(-1.0, 1.0, num_bands)
+        global_offset = torch.randn(()) * self.random_global_std_db
+        tilt = torch.randn(()) * self.random_tilt_std_db * band_positions
+
+        local_center = torch.rand(()) * (num_bands - 1)
+        local_width = 0.75 + (torch.rand(()) * 1.75)
+        local_shape = torch.exp(
+            -0.5 * ((torch.arange(num_bands) - local_center) / local_width).square()
+        )
+        local_shape = local_shape * (torch.randn(()) * self.random_local_std_db)
+
+        return torch.clamp(
+            base_profile + smooth_noise + global_offset + tilt + local_shape,
+            min=self.random_min_gain_db,
+            max=self.random_max_gain_db,
+        )
+
+    def _render_random_eq_target(
+        self,
+        clean_audio: FloatTensor,
+        eq_params: FloatTensor,
+    ) -> FloatTensor:
+        """Render an unpersisted static EQ target from the sampled gain curve."""
+        if clean_audio.numel() == 0:
+            return clean_audio
+
+        rfft_freqs = np.fft.rfftfreq(clean_audio.numel(), d=1.0 / self.sample_rate)
+        control_freqs = np.asarray(DEFAULT_EQ_TEMPLATE_FREQS_HZ, dtype=np.float64)
+        control_gains = eq_params.detach().cpu().numpy().astype(np.float64)
+        log_freqs = np.log(np.maximum(rfft_freqs, control_freqs[0]))
+        gain_curve = np.interp(
+            log_freqs,
+            np.log(control_freqs),
+            control_gains,
+            left=control_gains[0],
+            right=control_gains[-1],
+        )
+        gain_db = torch.from_numpy(gain_curve.astype(np.float32))
+        linear_gain = torch.pow(10.0, gain_db / 20.0)
+
+        rendered = torch.fft.irfft(
+            torch.fft.rfft(clean_audio) * linear_gain,
+            n=clean_audio.numel(),
+        )
+        peak = rendered.abs().amax()
+        if peak > 0.99:
+            rendered = rendered * (0.99 / peak)
+
+        return rendered
 
     def __len__(self):
         return len(self.utts)
@@ -849,11 +1057,9 @@ class VitsDataset(Dataset):
         self,
         idx: int,
         eq_idx: Optional[int] = None,
-        load_target_spectrogram: bool = False,
     ) -> UtteranceTensors:
         utt = self.utts[idx]
         target_audio: Optional[FloatTensor] = None
-        target_spectrogram: Optional[FloatTensor] = None
         eq_params: Optional[FloatTensor] = None
         eq_profile_id: Optional[int] = None
 
@@ -863,17 +1069,42 @@ class VitsDataset(Dataset):
             audio_norm = audio_norm[0]
 
         if self.use_eq:
-            assert utt.eq_audio_paths is not None
-            assert utt.eq_spec_paths is not None
-            if eq_idx is None:
-                eq_idx = torch.randint(0, self.num_eq_profiles, (1,)).item()
-            eq_profile_id = eq_idx
-            target_audio = torch.load(utt.eq_audio_paths[eq_idx])
-            if target_audio.dim() == 2:
-                target_audio = target_audio[0]
-            if load_target_spectrogram:
-                target_spectrogram = torch.load(utt.eq_spec_paths[eq_idx])
-            eq_params = FloatTensor(self.eq_template_params[eq_idx])
+            use_random_profile = (
+                (eq_idx is None)
+                and (self.random_profile_probability > 0.0)
+                and (torch.rand(()) < self.random_profile_probability)
+            )
+            if use_random_profile:
+                eq_profile_id = -1
+                eq_params = self._sample_random_eq_profile()
+                target_audio = self._render_random_eq_target(audio_norm, eq_params)
+            else:
+                if eq_idx is None:
+                    eq_idx = torch.randint(0, self.num_eq_profiles, (1,)).item()
+                eq_profile_id = eq_idx
+                if eq_idx == 0:
+                    target_audio = audio_norm
+                else:
+                    source_idx = eq_idx - 1
+                    assert utt.eq_audio_source_paths is not None
+                    eq_audio_cache_path = (
+                        utt.eq_audio_cache_paths[source_idx]
+                        if utt.eq_audio_cache_paths is not None
+                        else None
+                    )
+                    if eq_audio_cache_path is not None:
+                        target_audio = torch.load(eq_audio_cache_path)
+                        if target_audio.dim() == 2:
+                            target_audio = target_audio[0]
+                    else:
+                        target_audio = _load_eq_target_audio(
+                            utt.eq_audio_source_paths[source_idx],
+                            sample_rate=self.sample_rate,
+                            trim_bounds=utt.clean_trim_bounds,
+                            reference_num_samples=utt.clean_source_length,
+                            target_num_samples=audio_norm.size(0),
+                        )
+                eq_params = FloatTensor(self.eq_template_params[eq_idx])
 
         return UtteranceTensors(
             phoneme_ids=torch.load(utt.phoneme_ids_path),
@@ -884,7 +1115,6 @@ class VitsDataset(Dataset):
             ),
             text=utt.text,
             target_audio=target_audio,
-            target_spectrogram=target_spectrogram,
             eq_params=eq_params,
             eq_profile_id=eq_profile_id,
         )

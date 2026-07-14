@@ -344,119 +344,62 @@ class VitsModel(L.LightningModule):
         return val_loss
 
     def on_validation_end(self) -> None:
-        # Generate audio examples after validation, but not during sanity check
         if self.trainer.sanity_checking:
             return super().on_validation_end()
 
-        if (
+        if not (
             getattr(self, "logger", None)
             and hasattr(self.logger, "experiment")
             and hasattr(self.logger.experiment, "add_audio")
         ):
-            datamodule = self.trainer.datamodule
-            eq_profiles = (
-                datamodule.eq_template_params
-                if self.hparams.use_eq_conditioning
-                else [[0.0] * self.hparams.n_eq_bands]
-            )
+            return super().on_validation_end()
 
-            for utt_idx in range(len(datamodule.test_dataset)):
-                test_utt = self._get_dataset_utterance(
-                    datamodule.test_dataset,
-                    utt_idx,
-                    eq_idx=0 if self.hparams.use_eq_conditioning else None,
-                )
-                text = test_utt.phoneme_ids.unsqueeze(0).to(self.device)
-                text_lengths = torch.LongTensor([len(test_utt.phoneme_ids)]).to(
-                    self.device
-                )
-                scales = [0.667, 1.0, 0.8]
-                sid = (
-                    test_utt.speaker_id.to(self.device)
-                    if test_utt.speaker_id is not None
+        datamodule = self.trainer.datamodule
+        eq_profiles = (
+            datamodule.eq_template_params
+            if self.hparams.use_eq_conditioning
+            else [[0.0] * self.hparams.n_eq_bands]
+        )
+
+        for utt_idx in range(len(datamodule.test_dataset)):
+            test_utt = self._get_dataset_utterance(
+                datamodule.test_dataset,
+                utt_idx,
+                eq_idx=0 if self.hparams.use_eq_conditioning else None,
+            )
+            text = test_utt.phoneme_ids.unsqueeze(0).to(self.device)
+            text_lengths = torch.LongTensor([len(test_utt.phoneme_ids)]).to(
+                self.device
+            )
+            sid = (
+                test_utt.speaker_id.to(self.device)
+                if test_utt.speaker_id is not None
+                else None
+            )
+            tag_base = test_utt.text or str(utt_idx)
+
+            for eq_idx, eq_profile in enumerate(eq_profiles):
+                eq_params = (
+                    torch.tensor(
+                        [eq_profile],
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    if self.hparams.use_eq_conditioning
                     else None
                 )
-
-                tag_base = test_utt.text or str(utt_idx)
-
-                # Log mel spectrograms as images.
-                # Mel values are log-magnitude (e.g. [-12, 2]), so min-max
-                # normalize each spectrogram to [0,1] for proper visualization.
-                def _norm_mel(m):
-                    m = m.squeeze(0).flip(0)  # [mel, T], freq low→high
-                    m_min, m_max = m.min(), m.max()
-                    if m_max > m_min:
-                        m = (m - m_min) / (m_max - m_min)
-                    return m.unsqueeze(0)  # [1, mel, T]
-
-                for eq_idx, eq_profile in enumerate(eq_profiles):
-                    eq_params = (
-                        torch.tensor(
-                            [eq_profile],
-                            dtype=torch.float32,
-                            device=self.device,
-                        )
-                        if self.hparams.use_eq_conditioning
-                        else None
-                    )
-                    audio = self(
-                        text,
-                        text_lengths,
-                        scales,
-                        sid=sid,
-                        eq_params=eq_params,
-                    ).detach()
-                    mel = mel_spectrogram_torch(
-                        audio.squeeze(1),
-                        self.hparams.filter_length,
-                        self.hparams.mel_channels,
-                        self.hparams.sample_rate,
-                        self.hparams.hop_length,
-                        self.hparams.win_length,
-                        self.hparams.mel_fmin,
-                        self.hparams.mel_fmax,
-                    )
-                    target_utt = self._get_dataset_utterance(
-                        datamodule.test_dataset,
-                        utt_idx,
-                        eq_idx=eq_idx if self.hparams.use_eq_conditioning else None,
-                        load_target_spectrogram=True,
-                    )
-                    target_spec = (
-                        target_utt.target_spectrogram
-                        if self.hparams.use_eq_conditioning
-                        and target_utt.target_spectrogram is not None
-                        else target_utt.spectrogram
-                    )
-                    target_mel = spec_to_mel_torch(
-                        target_spec.unsqueeze(0).to(self.device),
-                        self.hparams.filter_length,
-                        self.hparams.mel_channels,
-                        self.hparams.sample_rate,
-                        self.hparams.mel_fmin,
-                        self.hparams.mel_fmax,
-                    )
-                    min_len = min(mel.size(-1), target_mel.size(-1))
-                    mel_loss = F.l1_loss(
-                        mel[..., :min_len],
-                        target_mel[..., :min_len],
-                    )
-
-                    self.logger.experiment.add_audio(
-                        f"{tag_base}/EQ_{eq_idx}",
-                        audio.squeeze(0),
-                        sample_rate=self.hparams.sample_rate,
-                    )
-                    self.logger.experiment.add_scalar(
-                        f"val_mel/{tag_base}_EQ_{eq_idx}_loss",
-                        mel_loss.item(),
-                        self.global_step,
-                    )
-                    self.logger.experiment.add_image(
-                        f"{tag_base}/mel_EQ_{eq_idx}",
-                        _norm_mel(mel),
-                        self.global_step,
-                    )
+                audio = self(
+                    text,
+                    text_lengths,
+                    [0.667, 1.0, 0.8],
+                    sid=sid,
+                    eq_params=eq_params,
+                ).detach()
+                self.logger.experiment.add_audio(
+                    f"{tag_base}/EQ_{eq_idx}",
+                    audio.squeeze(0),
+                    sample_rate=self.hparams.sample_rate,
+                )
 
         return super().on_validation_end()
 
@@ -465,18 +408,13 @@ class VitsModel(L.LightningModule):
         dataset,
         idx: int,
         eq_idx: Optional[int] = None,
-        load_target_spectrogram: bool = False,
     ):
         while hasattr(dataset, "dataset") and hasattr(dataset, "indices"):
             idx = dataset.indices[idx]
             dataset = dataset.dataset
 
         if hasattr(dataset, "get_utterance"):
-            return dataset.get_utterance(
-                idx,
-                eq_idx=eq_idx,
-                load_target_spectrogram=load_target_spectrogram,
-            )
+            return dataset.get_utterance(idx, eq_idx=eq_idx)
 
         return dataset[idx]
 
